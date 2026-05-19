@@ -414,6 +414,7 @@ def global_placement_main(gpdb, rawdb, ps: ParamScheduler, data: PlaceData, args
     info = ("%d_gp" % (iteration + 1), hpwl, data.design_name)
     if args.draw_placement:
         draw_fig_with_cairo_cpp(node_pos, data.node_size, data, info, args)
+    draw_placement_with_pdn(node_pos, data.node_size, gpdb, data, info, args)
     logger.info("After GP, best solution eval, exact HPWL: %.6E exact Overflow: %.4f" % (hpwl, overflow))
     ps.visualize(args, logger)
     gp_hpwl = hpwl

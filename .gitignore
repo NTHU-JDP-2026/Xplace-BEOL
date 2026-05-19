@@ -10,6 +10,10 @@ build/
 *.pt
 *.pkl
 *.json
+*.def
+*.lef
+*.guide
+xplace_work
 result/
 data/cad
 data/raw

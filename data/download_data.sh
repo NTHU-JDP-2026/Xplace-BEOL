@@ -58,7 +58,7 @@ do
     rm -rf ispd19_test$i.tgz
     mv ispd19_test$i/ raw/ispd2019/
 done
-python remove_fence_in_ispd19_test5.py
+python3 remove_fence_in_ispd19_test5.py
 
 # echo "=== (Optional) Converting raw design to torch data ==="
 # python convert_design_to_torch_data.py --dataset ispd2005

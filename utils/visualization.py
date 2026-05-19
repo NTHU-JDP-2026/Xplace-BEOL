@@ -227,6 +227,148 @@ def visualize_electronic_variables(density_map, potential_map, force_map, info, 
     cv2.imwrite(png_path, img)
 
 
+def draw_placement_with_pdn(node_pos, node_size, gpdb, data, info, args, base_size=2048):
+    """Draw post-GP placement with PDN power stripes and placement rows."""
+    import matplotlib
+    matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
+    import matplotlib.patches as mpatches
+    from matplotlib.collections import PatchCollection
+
+    iteration, hpwl, design_name = info
+    filename = "%s_iter%s_pdn.png" % (design_name, iteration)
+    res_root = os.path.join(args.result_dir, args.exp_id)
+    png_path = os.path.join(res_root, args.eval_dir, filename)
+    if not os.path.exists(os.path.dirname(png_path)):
+        os.makedirs(os.path.dirname(png_path))
+
+    # Die bounds: __ori_die_info__ is [lx, hx, ly, hy]
+    lx, hx, ly, hy = data.__ori_die_info__
+    die_w, die_h = hx - lx, hy - ly
+
+    # Convert normalized node coords back to DB units
+    scaleX = data.die_scale[0].cpu().item()
+    scaleY = data.die_scale[1].cpu().item()
+    shiftX = data.die_shift[0].cpu().item()
+    shiftY = data.die_shift[1].cpu().item()
+    node_pos_cpu = node_pos.detach().cpu()
+    node_size_cpu = node_size.detach().cpu()
+    pos_x = (node_pos_cpu[:, 0] * scaleX + shiftX).numpy()
+    pos_y = (node_pos_cpu[:, 1] * scaleY + shiftY).numpy()
+    sz_x = (node_size_cpu[:, 0] * scaleX).numpy()
+    sz_y = (node_size_cpu[:, 1] * scaleY).numpy()
+
+    fig_w = base_size / 100.0
+    fig_h = fig_w * die_h / die_w
+    fig, ax = plt.subplots(figsize=(fig_w, fig_h), dpi=100)
+    ax.set_xlim(lx, hx)
+    ax.set_ylim(ly, hy)
+    ax.set_aspect("equal")
+    ax.set_facecolor("white")
+
+    # --- Placement rows (alternating gray bands) ---
+    try:
+        coreLX, coreHX, coreLY, coreHY = gpdb.coreInfo()
+        site_h = gpdb.siteHeight()
+        if site_h > 0:
+            num_rows = int(round((coreHY - coreLY) / site_h))
+            row_w = coreHX - coreLX
+            even_patches, odd_patches = [], []
+            for i in range(num_rows):
+                ry = coreLY + i * site_h
+                rect = mpatches.Rectangle((coreLX, ry), row_w, site_h)
+                (even_patches if i % 2 == 0 else odd_patches).append(rect)
+            for patches, fc in ((even_patches, "#f2f2f2"), (odd_patches, "#e6e6e6")):
+                if patches:
+                    ax.add_collection(PatchCollection(patches, facecolor=fc, edgecolor="none", zorder=1))
+    except Exception:
+        pass
+
+    # --- PDN power stripes, colored by metal layer ---
+    # Layer color table: (facecolor, alpha)
+    _layer_style = [
+        ("#E55C5C", 0.55),  # M1  red
+        ("#F5A623", 0.55),  # M2  orange
+        ("#4A90D9", 0.60),  # M3  blue
+        ("#7ED321", 0.60),  # M4  green
+        ("#9B59B6", 0.60),  # M5  purple
+        ("#F0E442", 0.60),  # M6  yellow
+        ("#1ABC9C", 0.60),  # M7  teal
+        ("#E91E8C", 0.60),  # M8  pink
+    ]
+    try:
+        snet_tensors = gpdb.snet_info_tensor()
+        if len(snet_tensors) == 3 and snet_tensors[0].numel() > 0:
+            snet_lpos_t, snet_sz_t, snet_layer_t = snet_tensors
+            snet_lpos_np = snet_lpos_t.numpy()
+            snet_sz_np = snet_sz_t.numpy()
+            snet_layer_np = snet_layer_t.numpy()
+            for layer_idx in np.unique(snet_layer_np):
+                mask = snet_layer_np == layer_idx
+                patches = [
+                    mpatches.Rectangle(
+                        (snet_lpos_np[i, 0], snet_lpos_np[i, 1]),
+                        snet_sz_np[i, 0], snet_sz_np[i, 1],
+                    )
+                    for i in np.where(mask)[0]
+                ]
+                fc, alpha = _layer_style[int(layer_idx) % len(_layer_style)]
+                ax.add_collection(
+                    PatchCollection(patches, facecolor=fc, alpha=alpha, edgecolor="none", zorder=3)
+                )
+    except Exception:
+        pass
+
+    # --- Cells ---
+    n = node_pos_cpu.shape[0]
+    mov_lhs, mov_rhs = data.movable_index
+    fix_lhs, fix_rhs = data.fixed_index
+
+    def _cell_patches(start, end):
+        patches = []
+        for i in range(start, min(end, n)):
+            patches.append(
+                mpatches.Rectangle(
+                    (pos_x[i] - sz_x[i] / 2, pos_y[i] - sz_y[i] / 2), sz_x[i], sz_y[i]
+                )
+            )
+        return patches
+
+    mov_patches = _cell_patches(mov_lhs, mov_rhs)
+    if mov_patches:
+        ax.add_collection(
+            PatchCollection(mov_patches, facecolor="#79B4BA", alpha=0.75, edgecolor="none", zorder=4)
+        )
+
+    fix_patches = _cell_patches(fix_lhs, fix_rhs)
+    if fix_patches:
+        ax.add_collection(
+            PatchCollection(fix_patches, facecolor="#E05D5D", alpha=0.85, edgecolor="none", zorder=4)
+        )
+
+    # Die outline
+    ax.add_patch(
+        mpatches.Rectangle((lx, ly), die_w, die_h, fill=False, edgecolor="black", linewidth=1.5, zorder=5)
+    )
+
+    ax.set_title("%s  iter%s  HPWL=%.2E" % (design_name, iteration, hpwl), fontsize=10)
+    ax.set_xlabel("X (DB units)")
+    ax.set_ylabel("Y (DB units)")
+    legend_handles = [
+        mpatches.Patch(facecolor="#f2f2f2", edgecolor="gray", label="Rows"),
+        mpatches.Patch(facecolor="#79B4BA", label="Movable cells"),
+        mpatches.Patch(facecolor="#E05D5D", label="Fixed cells"),
+    ]
+    for li, (fc, _) in enumerate(_layer_style[:4]):
+        legend_handles.append(mpatches.Patch(facecolor=fc, label="PDN M%d" % (li + 1)))
+    ax.legend(handles=legend_handles, loc="upper right", fontsize=7, framealpha=0.8)
+
+    plt.tight_layout()
+    plt.savefig(png_path, bbox_inches="tight", dpi=100)
+    plt.close(fig)
+    logging.getLogger(__name__).info("PDN placement figure saved to %s" % png_path)
+
+
 def draw_grad_abs_mean(
     wl_grads, density_grads, iterations, info, args,
 ):
