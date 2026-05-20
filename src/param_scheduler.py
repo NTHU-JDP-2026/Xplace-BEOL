@@ -284,10 +284,11 @@ class ParamScheduler:
             if self.skip_update:
                 return
         delta_hpwl = self.recorder.hpwl[-1] - self.recorder.hpwl[-2]
+        coef = self.density_weight_coef
         if delta_hpwl < 0:
-            self.mu = 1.05 * np.maximum(np.power(0.9999, float(self.iter - self.init_iter)), 0.98)
+            self.mu = coef * np.maximum(np.power(0.9999, float(self.iter - self.init_iter)), 0.98)
         else:
-            self.mu = 1.05 * np.clip(np.power(1.05, -delta_hpwl / 350000), 0.95, 1.05)
+            self.mu = coef * np.clip(np.power(coef, -delta_hpwl / 350000), 0.95, coef)
         self.density_weight *= self.mu
 
         if (
