@@ -369,6 +369,103 @@ def draw_placement_with_pdn(node_pos, node_size, gpdb, data, info, args, base_si
     logging.getLogger(__name__).info("PDN placement figure saved to %s" % png_path)
 
 
+def draw_bin_density_map(node_pos, node_size, data, info, args):
+    """
+    Draw total bin occupancy after global placement.
+
+    total_occ per bin = fixed density (PDN + fixed cells) + movable cell density,
+    both as fractions of bin area.  Bins exceeding target_density are shown in red.
+
+    fixed_occ  = init_density_map / target_density
+    mov_occ    = density_map_cuda.forward_naive over movable nodes
+    total_occ  = fixed_occ + mov_occ
+    """
+    import matplotlib
+    matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
+    import matplotlib.patches as mpatches
+    import matplotlib.colors as mcolors
+    from cpp_to_py import density_map_cuda
+
+    iteration, hpwl, design_name = info
+    filename = "%s_iter%s_bin_density.png" % (design_name, iteration)
+    res_root = os.path.join(args.result_dir, args.exp_id)
+    png_path = os.path.join(res_root, args.eval_dir, filename)
+    if not os.path.exists(os.path.dirname(png_path)):
+        os.makedirs(os.path.dirname(png_path))
+
+    lx, hx, ly, hy = data.__ori_die_info__
+    target_density = args.target_density
+
+    # --- Movable cell density (raw area fraction per bin) ---
+    mov_lhs, mov_rhs = data.movable_index
+    mov_pos  = node_pos[mov_lhs:mov_rhs].detach()
+    mov_size = node_size[mov_lhs:mov_rhs].detach()
+    device, dtype = mov_pos.device, mov_pos.dtype
+    zeros_map = torch.zeros((data.num_bin_x, data.num_bin_y), device=device, dtype=dtype)
+    node_weight = mov_size.new_ones(mov_size.shape[0])
+    mov_occ = density_map_cuda.forward_naive(
+        mov_pos, mov_size, node_weight, data.unit_len, zeros_map,
+        data.num_bin_x, data.num_bin_y, mov_pos.shape[0],
+        -1.0, -1.0, 1e-4, False, args.deterministic,
+    ).contiguous()
+
+    # --- Fixed density: init_density_map in [0, target_density] → normalise to [0, 1] ---
+    fixed_occ = data.init_density_map / target_density
+
+    # --- Total occupancy (can exceed 1 in overflow bins) ---
+    total_occ = (fixed_occ + mov_occ).cpu().numpy()
+
+    # imshow expects (rows=y, cols=x); density maps are (num_bin_x, num_bin_y) → transpose
+    im_data = total_occ.T
+
+    # Colormap: green→yellow below target, yellow→red above target
+    vmax = float(max(im_data.max(), target_density * 1.05))
+    norm = mcolors.TwoSlopeNorm(vmin=0.0, vcenter=target_density, vmax=vmax)
+
+    die_w, die_h = hx - lx, hy - ly
+    fig_w, fig_h = 10.0, 10.0 * die_h / die_w
+    fig, ax = plt.subplots(figsize=(fig_w, fig_h), dpi=100)
+
+    im = ax.imshow(
+        im_data,
+        origin="lower",
+        extent=[lx, hx, ly, hy],
+        cmap=plt.cm.RdYlGn_r,
+        norm=norm,
+        aspect="auto",
+        interpolation="nearest",
+    )
+
+    cbar = fig.colorbar(im, ax=ax, fraction=0.03, pad=0.02)
+    cbar.set_label("Bin occupancy (fraction of bin area)", fontsize=8)
+    cbar.ax.axhline(y=target_density, color="blue", linewidth=1.5, linestyle="--")
+    cbar.ax.text(
+        2.3, target_density, "target=%.2f" % target_density,
+        va="center", ha="left", fontsize=7, color="blue",
+        transform=cbar.ax.transData,
+    )
+
+    ax.add_patch(mpatches.Rectangle(
+        (lx, ly), die_w, die_h,
+        fill=False, edgecolor="black", linewidth=1.5, zorder=5,
+    ))
+    ax.set_title(
+        "%s  iter%s  HPWL=%.2E\n"
+        "Bin density = fixed(PDN+cells) + movable cells  |  "
+        "target=%.2f  bins=%dx%d"
+        % (design_name, iteration, hpwl, target_density, data.num_bin_x, data.num_bin_y),
+        fontsize=9,
+    )
+    ax.set_xlabel("X (DB units)")
+    ax.set_ylabel("Y (DB units)")
+
+    plt.tight_layout()
+    plt.savefig(png_path, bbox_inches="tight", dpi=100)
+    plt.close(fig)
+    logging.getLogger(__name__).info("Bin density map saved to %s" % png_path)
+
+
 def draw_grad_abs_mean(
     wl_grads, density_grads, iterations, info, args,
 ):
