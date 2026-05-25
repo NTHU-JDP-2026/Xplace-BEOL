@@ -39,6 +39,8 @@ def get_option():
     parser.add_argument("--mixed_size", type=str2bool, default=False, help="enable mixed size placement")
 
     # global routing params
+    parser.add_argument('--use_m3_snet_density', type=str2bool, default=False, help='add M3 power stripe virtual blockage to density map, reducing available cell capacity in those bins to mitigate PDN routing DRV')
+    parser.add_argument('--m3_density_reduction_factor', type=float, default=0.7, help='[0,1] fraction of target_density available for cells in M3 stripe bins; lower = stronger repulsion (e.g. 0.6 = 40pct capacity reduction)')
     parser.add_argument('--use_cell_inflate', type=str2bool, default=False, help='use cell inflation')
     parser.add_argument('--min_area_inc', type=float, default=0.01, help='threshold of terminating inflation')
     parser.add_argument('--use_route_force', type=str2bool, default=False, help='use routing force')

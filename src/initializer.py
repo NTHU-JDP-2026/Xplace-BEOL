@@ -4,6 +4,62 @@ from cpp_to_py import density_map_cuda
 from .core import merged_wl_loss_grad, merged_wl_loss_grad_timing
 
 
+def _apply_m3_snet_density_reduction(gpdb, data, args, init_density_map, device, logger):
+    """Add virtual blockage to bins overlapping M3 power stripes.
+
+    After init_density_map has been scaled by target_density, bins that contain
+    M3 snet segments receive extra density so their effective cell capacity
+    becomes (factor * target_density) instead of target_density.  This pushes
+    cells away from PDN regions and reduces routing DRV near M3 power stripes.
+    """
+    factor = getattr(args, 'm3_density_reduction_factor', 0.7)
+    if not (0.0 < factor < 1.0):
+        logger.warning(
+            "m3_density_reduction_factor=%.2f is out of (0, 1); skipping M3 density reduction." % factor
+        )
+        return
+
+    snet_lpos_all, snet_size_all, snet_layer_all = gpdb.snet_info_tensor()
+    snet_lpos_all = snet_lpos_all.to(device)
+    snet_size_all = snet_size_all.to(device)
+    snet_layer_all = snet_layer_all.to(device)
+
+    m3_mask = snet_layer_all == 2  # M3 is layer index 2
+    if m3_mask.sum() == 0:
+        logger.info("No M3 snet segments found; skipping M3 density reduction.")
+        return
+
+    m3_lpos = snet_lpos_all[m3_mask, :] - data.die_shift
+    m3_lpos = m3_lpos / data.die_scale
+    m3_size = snet_size_all[m3_mask, :] / data.die_scale
+    m3_pos = m3_lpos + m3_size / 2
+    m3_weight = m3_size.new_ones(m3_size.shape[0])
+
+    aux = torch.zeros(
+        (data.num_bin_x, data.num_bin_y), device=device, dtype=init_density_map.dtype
+    )
+    m3_density_map = density_map_cuda.forward_naive(
+        m3_pos, m3_size, m3_weight, data.unit_len,
+        aux,
+        data.num_bin_x, data.num_bin_y, m3_pos.shape[0],
+        -1.0, -1.0, 1e-4, False, args.deterministic,
+    ).contiguous()
+
+    # Virtual blockage = (1 - factor) * target_density for bins that have M3 stripe.
+    # After adding this, the remaining capacity for cells becomes factor * target_density.
+    m3_bin_mask = m3_density_map > 0
+    virtual_blockage = m3_bin_mask.float() * (1.0 - factor) * args.target_density
+    init_density_map.add_(virtual_blockage).clamp_(max=args.target_density)
+
+    num_affected = m3_bin_mask.sum().item()
+    total_bins = data.num_bin_x * data.num_bin_y
+    logger.info(
+        "M3 snet density reduction: factor=%.2f, affected bins=%d / %d (%.1f%%)" % (
+            factor, num_affected, total_bins, 100.0 * num_affected / total_bins
+        )
+    )
+
+
 def get_init_density_map(rawdb, gpdb, data: PlaceData, args, logger, ps=None):
     lhs, rhs = data.fixed_index
     device = data.node_size.get_device()
@@ -37,7 +93,7 @@ def get_init_density_map(rawdb, gpdb, data: PlaceData, args, logger, ps=None):
     if (init_density_map < 0).sum() > 0:
         logger.error("init_density_map has negative value. Please check.")
     if args.use_route_force or args.use_cell_inflate:
-        # consider snet as plaement blkg in density map to resolve M2 Vertical 
+        # consider snet as plaement blkg in density map to resolve M2 Vertical
         # SNet pin access problem
         if gpdb is not None and gpdb.m1direction() == 0:
             # TODO: only include snet density when util is small
@@ -80,6 +136,12 @@ def get_init_density_map(rawdb, gpdb, data: PlaceData, args, logger, ps=None):
                     init_density_map.clamp_(min=0.0, max=1.0)
 
     init_density_map.clamp_(min=0.0, max=1.0).mul_(args.target_density)
+
+    if getattr(args, 'use_m3_snet_density', False) and gpdb is not None:
+        _apply_m3_snet_density_reduction(
+            gpdb, data, args, init_density_map, device, logger
+        )
+
     if args.use_route_force or args.use_cell_inflate:
         # inflate connected IOPins
         _, fix_rhs, _ = data.node_type_indices[2]
@@ -103,10 +165,10 @@ def get_init_density_map(rawdb, gpdb, data: PlaceData, args, logger, ps=None):
 
 
 def init_params(
-    mov_node_pos, trunc_node_pos_fn, mov_lhs, mov_rhs, conn_fix_node_pos, 
-    density_map_layer, mov_node_size, expand_ratio, init_density_map, optimizer, 
+    mov_node_pos, trunc_node_pos_fn, mov_lhs, mov_rhs, conn_fix_node_pos,
+    density_map_layer, mov_node_size, expand_ratio, init_density_map, optimizer,
     ps, data, args, route_fn=None
-):  
+):
     mov_node_pos = trunc_node_pos_fn(mov_node_pos)
     conn_node_pos = mov_node_pos[mov_lhs:mov_rhs, ...]
     conn_node_pos = torch.cat(
@@ -115,7 +177,7 @@ def init_params(
     _, conn_node_grad = merged_wl_loss_grad(
         conn_node_pos, data.pin_id2node_id, data.pin_rel_cpos,
         data.node2pin_list, data.node2pin_list_end,
-        data.hyperedge_list, data.hyperedge_list_end, data.net_mask, 
+        data.hyperedge_list, data.hyperedge_list_end, data.net_mask,
         data.hpwl_scale, ps.wa_coeff, args.deterministic
     )
     wl_grad = torch.zeros_like(mov_node_pos).detach()
