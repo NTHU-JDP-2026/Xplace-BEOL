@@ -2,7 +2,7 @@
 """
 Train a U-Net to predict DRV density maps from placement feature maps.
 
-Input  : (4, 256, 256) – [pin_density, AP, stripe, cell_type_mixture]
+Input  : (5, 256, 256) – [pin_density, ap, cell_type, aoi, rudy]
 Output : (1, 256, 256) – predicted DRV map
 
 Architecture choice: U-Net
@@ -47,6 +47,32 @@ def set_seed(seed=42):
     np.random.seed(seed)
     torch.manual_seed(seed)
     torch.cuda.manual_seed_all(seed)
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# Test-Time Augmentation
+# ──────────────────────────────────────────────────────────────────────────────
+
+@torch.no_grad()
+def tta_predict(model, x):
+    """
+    Average predictions over all 8 D4 symmetries (4 rotations × 2 h-flips).
+
+    x : (C, H, W) tensor on device (no batch dim).
+    Returns (1, H, W).
+    """
+    preds = []
+    for k in range(4):
+        for hflip in (False, True):
+            xi = torch.rot90(x, k, dims=[-2, -1])
+            if hflip:
+                xi = torch.flip(xi, dims=[-1])
+            out = model(xi.unsqueeze(0)).squeeze(0)
+            if hflip:
+                out = torch.flip(out, dims=[-1])
+            out = torch.rot90(out, 4 - k, dims=[-2, -1])
+            preds.append(out)
+    return torch.stack(preds).mean(0)   # (1, H, W)
 
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -123,14 +149,18 @@ def _resize(x, y, resolution):
 # ──────────────────────────────────────────────────────────────────────────────
 
 class _ConvBlock(nn.Module):
-    def __init__(self, in_ch, out_ch, dropout=0.0):
+    def __init__(self, in_ch, out_ch, dropout=0.0, norm='instance'):
         super().__init__()
+        def _norm(ch):
+            if norm == 'instance':
+                return nn.InstanceNorm2d(ch, affine=True)
+            return nn.BatchNorm2d(ch)
         layers = [
             nn.Conv2d(in_ch,  out_ch, 3, padding=1, bias=False),
-            nn.BatchNorm2d(out_ch),
+            _norm(out_ch),
             nn.ReLU(inplace=True),
             nn.Conv2d(out_ch, out_ch, 3, padding=1, bias=False),
-            nn.BatchNorm2d(out_ch),
+            _norm(out_ch),
             nn.ReLU(inplace=True),
         ]
         if dropout > 0:
@@ -150,33 +180,42 @@ class UNet(nn.Module):
     Decoder:     mirrors encoder, skip connections at each level
     Output head: Conv1×1 → Sigmoid  (keeps prediction in [0, 1])
 
+    Dropout schedule (controlled by `dropout` arg):
+      enc1, enc2  : 0            (early low-level features, keep intact)
+      enc3, enc4  : dropout×0.5  (deep encoder, light regularization)
+      bottleneck  : dropout      (full)
+      dec4–dec2   : dropout      (decoder — main source of design memorization)
+      dec1        : 0            (final upsampling, keep spatial detail)
+
     Default base_ch=16 → ~1.9M parameters.
-    Suitable for ~34 training samples with aggressive augmentation.
     """
 
-    def __init__(self, in_ch=3, base_ch=16, dropout=0.3):
+    def __init__(self, in_ch=3, base_ch=16, dropout=0.3, norm='instance'):
         super().__init__()
-        C = base_ch
+        C  = base_ch
+        kw = dict(norm=norm)
+        dp = dropout          # full dropout rate
+        ld = dropout * 0.5    # light dropout for deep encoder
 
         # Encoder
-        self.enc1 = _ConvBlock(in_ch, C)
-        self.enc2 = _ConvBlock(C,     C*2)
-        self.enc3 = _ConvBlock(C*2,   C*4)
-        self.enc4 = _ConvBlock(C*4,   C*8)
+        self.enc1 = _ConvBlock(in_ch, C,   **kw)
+        self.enc2 = _ConvBlock(C,    C*2,  **kw)
+        self.enc3 = _ConvBlock(C*2,  C*4,  dropout=ld, **kw)
+        self.enc4 = _ConvBlock(C*4,  C*8,  dropout=ld, **kw)
         self.pool = nn.MaxPool2d(2)
 
         # Bottleneck
-        self.bottleneck = _ConvBlock(C*8, C*16, dropout=dropout)
+        self.bottleneck = _ConvBlock(C*8, C*16, dropout=dp, **kw)
 
         # Decoder
         self.up4  = nn.ConvTranspose2d(C*16, C*8,  2, stride=2)
-        self.dec4 = _ConvBlock(C*16, C*8)
+        self.dec4 = _ConvBlock(C*16, C*8,  dropout=dp, **kw)
         self.up3  = nn.ConvTranspose2d(C*8,  C*4,  2, stride=2)
-        self.dec3 = _ConvBlock(C*8,  C*4)
+        self.dec3 = _ConvBlock(C*8,  C*4,  dropout=dp, **kw)
         self.up2  = nn.ConvTranspose2d(C*4,  C*2,  2, stride=2)
-        self.dec2 = _ConvBlock(C*4,  C*2)
+        self.dec2 = _ConvBlock(C*4,  C*2,  dropout=dp, **kw)
         self.up1  = nn.ConvTranspose2d(C*2,  C,    2, stride=2)
-        self.dec1 = _ConvBlock(C*2,  C)
+        self.dec1 = _ConvBlock(C*2,  C,    **kw)
 
         # Output head
         self.head = nn.Sequential(nn.Conv2d(C, 1, 1), nn.Sigmoid())
@@ -218,6 +257,49 @@ def drv_loss(pred, target, alpha=20.0):
 # Metrics
 # ──────────────────────────────────────────────────────────────────────────────
 
+def _ssim_map(pred: torch.Tensor, target: torch.Tensor,
+              window_size: int = 11, sigma: float = 1.5) -> float:
+    """
+    Compute SSIM between two (1, H, W) or (H, W) float tensors in [0, 1].
+
+    Uses a Gaussian-weighted sliding window (same as Wang et al. 2004).
+    Returns a scalar in [-1, 1].
+    """
+    p = pred.detach().cpu().float()
+    t = target.detach().cpu().float()
+    if p.dim() == 2:
+        p = p.unsqueeze(0).unsqueeze(0)   # (1,1,H,W)
+        t = t.unsqueeze(0).unsqueeze(0)
+    elif p.dim() == 3:
+        p = p.unsqueeze(0)                # (1,C,H,W)
+        t = t.unsqueeze(0)
+
+    # Build 2-D Gaussian kernel
+    half = window_size // 2
+    coords = torch.arange(window_size, dtype=torch.float32) - half
+    g1d = torch.exp(-0.5 * (coords / sigma) ** 2)
+    g1d = g1d / g1d.sum()
+    kernel = g1d.outer(g1d).unsqueeze(0).unsqueeze(0)   # (1,1,W,W)
+    C = p.shape[1]
+    kernel = kernel.expand(C, 1, window_size, window_size)
+    pad = half
+
+    mu_p  = F.conv2d(p, kernel, padding=pad, groups=C)
+    mu_t  = F.conv2d(t, kernel, padding=pad, groups=C)
+    mu_p2 = mu_p * mu_p
+    mu_t2 = mu_t * mu_t
+    mu_pt = mu_p * mu_t
+
+    sig_p2  = F.conv2d(p * p, kernel, padding=pad, groups=C) - mu_p2
+    sig_t2  = F.conv2d(t * t, kernel, padding=pad, groups=C) - mu_t2
+    sig_pt  = F.conv2d(p * t, kernel, padding=pad, groups=C) - mu_pt
+
+    C1, C2 = 0.01 ** 2, 0.03 ** 2
+    ssim_map = ((2 * mu_pt + C1) * (2 * sig_pt + C2)) / \
+               ((mu_p2 + mu_t2 + C1) * (sig_p2 + sig_t2 + C2))
+    return float(ssim_map.mean())
+
+
 @torch.no_grad()
 def batch_metrics(pred, target, drv_threshold=0.1):
     """
@@ -225,7 +307,9 @@ def batch_metrics(pred, target, drv_threshold=0.1):
 
     Returns dict with:
       mse, rmse, mae          – full-map regression errors
+      nrms                    – RMSE normalised by gt range (RMSE / (max_gt - min_gt))
       corr                    – Pearson correlation (spatial pattern match)
+      ssim                    – structural similarity index (Wang et al. 2004)
       drv_mae, drv_mse        – errors restricted to gt > drv_threshold bins
     """
     p = pred.detach().cpu().float().numpy().ravel()
@@ -235,16 +319,22 @@ def batch_metrics(pred, target, drv_threshold=0.1):
     rmse = float(np.sqrt(mse))
     mae  = float(np.mean(np.abs(p - t)))
 
+    t_range = float(t.max() - t.min())
+    nrms = rmse / t_range if t_range > 1e-8 else 0.0
+
     if p.std() > 1e-8 and t.std() > 1e-8:
         corr = float(np.corrcoef(p, t)[0, 1])
     else:
         corr = 0.0
 
+    ssim = _ssim_map(pred.detach().cpu().float(),
+                     target.detach().cpu().float())
+
     mask = t > drv_threshold
     drv_mse = float(np.mean((p[mask] - t[mask]) ** 2)) if mask.any() else 0.0
     drv_mae = float(np.mean(np.abs(p[mask] - t[mask]))) if mask.any() else 0.0
 
-    return dict(mse=mse, rmse=rmse, mae=mae, corr=corr,
+    return dict(mse=mse, rmse=rmse, mae=mae, nrms=nrms, corr=corr, ssim=ssim,
                 drv_mse=drv_mse, drv_mae=drv_mae)
 
 
@@ -252,16 +342,31 @@ def batch_metrics(pred, target, drv_threshold=0.1):
 # Training loop
 # ──────────────────────────────────────────────────────────────────────────────
 
-def _pick_test_indices(dataset):
-    """Return [last_aes_idx, last_jpeg_idx] as held-out test samples."""
-    aes_idx = jpeg_idx = None
+def _pick_test_indices(dataset, holdout_designs=('seed', 'cast')):
+    """Return all indices whose filename matches any of the holdout_designs."""
+    test_idx = []
     for i, f in enumerate(dataset.files):
         name = os.path.basename(f)
-        if 'aes' in name:
-            aes_idx = i
-        elif 'jpeg' in name:
-            jpeg_idx = i
-    return [idx for idx in [aes_idx, jpeg_idx] if idx is not None]
+        if any(f'data_{d}_' in name for d in holdout_designs):
+            test_idx.append(i)
+    return test_idx
+
+
+def _pick_exclude_indices(dataset, exclude_designs=()):
+    """Return indices to drop from training.
+
+    Each pattern is matched as a raw substring of the sample filename, so you
+    can be as specific as needed:
+      'data_syn2_'   – excludes syn2 but not syn12 or syn20
+      'data_aes_0'   – excludes data_aes_0.5_*, data_aes_0.6_*, etc.
+                       but NOT data_aes_cipher_top_* (different prefix)
+    """
+    excl = set()
+    for i, f in enumerate(dataset.files):
+        name = os.path.basename(f)
+        if any(d in name for d in exclude_designs):
+            excl.add(i)
+    return excl
 
 
 def train(args):
@@ -270,15 +375,24 @@ def train(args):
     print(f"Device: {device}")
 
     # ── data ─────────────────────────────────────────────────────────────────
-    base_ds = PlacementMapDataset(args.processed_dir)
+    input_keys = tuple(k.strip() for k in args.features.split(','))
+    base_ds = PlacementMapDataset(args.processed_dir, input_keys=input_keys)
     in_ch   = len(base_ds.input_idx)
 
-    # Hold out 1 aes + 1 jpeg for testing
-    test_indices  = _pick_test_indices(base_ds)
-    train_indices = [i for i in range(len(base_ds)) if i not in set(test_indices)]
-    print(f"Test samples  ({len(test_indices)}): "
-          f"{[base_ds.sample_name(i) for i in test_indices]}")
-    print(f"Train samples ({len(train_indices)})")
+    # Hold out all seed + cast samples for testing (never seen during training)
+    holdout = [d.strip() for d in args.holdout_designs.split(',')]
+    test_indices  = _pick_test_indices(base_ds, holdout_designs=holdout)
+
+    # Exclude duplicate / degenerate design families from training
+    exclude = [d.strip() for d in args.exclude_designs.split(',') if d.strip()]
+    excl_set = _pick_exclude_indices(base_ds, exclude_designs=exclude)
+
+    train_indices = [i for i in range(len(base_ds))
+                     if i not in set(test_indices) and i not in excl_set]
+    print(f"Holdout designs : {holdout}")
+    print(f"Exclude designs : {exclude}  ({len(excl_set)} samples dropped)")
+    print(f"Test  samples   : {len(test_indices)}")
+    print(f"Train samples   : {len(train_indices)}")
 
     train_subset = Subset(base_ds, train_indices)
     train_ds = AugmentedDataset(train_subset, augment=True, noise_std=0.005,
@@ -290,8 +404,9 @@ def train(args):
           f"in_ch={in_ch}  resolution={args.resolution}×{args.resolution}")
 
     # ── model ─────────────────────────────────────────────────────────────────
-    model = UNet(in_ch=in_ch, base_ch=args.base_ch, dropout=args.dropout).to(device)
-    print(f"U-Net parameters: {count_parameters(model):,}")
+    model = UNet(in_ch=in_ch, base_ch=args.base_ch, dropout=args.dropout,
+                 norm=args.norm).to(device)
+    print(f"U-Net parameters: {count_parameters(model):,}  norm={args.norm}")
 
     # ── optimiser + scheduler ─────────────────────────────────────────────────
     opt = torch.optim.AdamW(model.parameters(), lr=args.lr,
@@ -300,7 +415,8 @@ def train(args):
         opt, T_max=args.epochs, eta_min=args.lr * 0.01)
 
     # ── history ───────────────────────────────────────────────────────────────
-    history = {k: [] for k in ('loss', 'mse', 'rmse', 'mae', 'corr', 'drv_mse', 'drv_mae')}
+    _MET_KEYS = ('mse', 'rmse', 'mae', 'nrms', 'corr', 'ssim', 'drv_mse', 'drv_mae')
+    history = {k: [] for k in ('loss',) + _MET_KEYS}
     best_loss = float('inf')
     os.makedirs(args.out_dir, exist_ok=True)
 
@@ -309,7 +425,7 @@ def train(args):
     for epoch in range(1, args.epochs + 1):
         model.train()
         ep_loss = 0.0
-        ep_met  = {k: 0.0 for k in ('mse', 'rmse', 'mae', 'corr', 'drv_mse', 'drv_mae')}
+        ep_met  = {k: 0.0 for k in _MET_KEYS}
 
         for x, y in loader:
             x, y = x.to(device), y.to(device)
@@ -348,7 +464,8 @@ def train(args):
             print(f"  epoch {epoch:4d}/{args.epochs}  "
                   f"loss={ep_loss:.5f}  mse={ep_met['mse']:.5f}  "
                   f"rmse={ep_met['rmse']:.5f}  mae={ep_met['mae']:.5f}  "
-                  f"corr={ep_met['corr']:.4f}  "
+                  f"nrms={ep_met['nrms']:.4f}  "
+                  f"corr={ep_met['corr']:.4f}  ssim={ep_met['ssim']:.4f}  "
                   f"drv_mse={ep_met['drv_mse']:.5f}  "
                   f"drv_mae={ep_met['drv_mae']:.5f}  "
                   f"lr={lr_now:.2e}")
@@ -365,19 +482,19 @@ def train(args):
 
     # ── prediction plots for held-out test samples ────────────────────────────
     for test_idx in test_indices:
-        name   = base_ds.sample_name(test_idx)
-        design = 'aes' if 'aes' in name else 'jpeg'
+        name = base_ds.sample_name(test_idx)
+        safe = name.replace('/', '_').replace(' ', '_')
         _plot_prediction(model, base_ds, device, args.out_dir,
                          sample_idx=test_idx, resolution=args.resolution,
-                         filename=f'prediction_test_{design}.png')
+                         filename=f'prediction_test_{safe}.png', tta=args.tta)
 
     # ── metrics: train samples ────────────────────────────────────────────────
     _eval_all(model, base_ds, device, args.out_dir, resolution=args.resolution,
-              indices=train_indices, label='train')
+              indices=train_indices, label='train', tta=args.tta)
 
     # ── metrics: test samples ─────────────────────────────────────────────────
     _eval_all(model, base_ds, device, args.out_dir, resolution=args.resolution,
-              indices=test_indices, label='test')
+              indices=test_indices, label='test', tta=args.tta)
 
     return model, history
 
@@ -387,11 +504,13 @@ def train(args):
 # ──────────────────────────────────────────────────────────────────────────────
 
 @torch.no_grad()
-def _eval_all(model, dataset, device, out_dir, resolution=256, indices=None, label=''):
+def _eval_all(model, dataset, device, out_dir, resolution=256, indices=None,
+              label='', tta=False):
     """Compute and print per-sample + aggregate metrics.
 
     indices: list of dataset indices to evaluate; defaults to all samples.
     label:   suffix for the output filename ('train' → eval_metrics_train.txt).
+    tta:     whether to use test-time augmentation (8× D4 symmetry average).
     """
     if indices is None:
         indices = list(range(len(dataset)))
@@ -401,12 +520,13 @@ def _eval_all(model, dataset, device, out_dir, resolution=256, indices=None, lab
         x, y = dataset[idx]
         if resolution != 256:
             x, y = _resize(x, y, resolution)
-        pred = model(x.unsqueeze(0).to(device)).squeeze(0)
+        x = x.to(device)
+        pred = tta_predict(model, x) if tta else model(x.unsqueeze(0)).squeeze(0)
         m = batch_metrics(pred, y)
         m['sample'] = dataset.sample_name(idx)
         rows.append(m)
 
-    keys = ('mse', 'rmse', 'mae', 'corr', 'drv_mse', 'drv_mae')
+    keys = ('mse', 'rmse', 'mae', 'nrms', 'corr', 'ssim', 'drv_mse', 'drv_mae')
     header = f"{'sample':45s}" + "".join(f"  {k:>10s}" for k in keys)
     lines  = [header, "-" * len(header)]
     for r in rows:
@@ -455,24 +575,26 @@ def _colorbar(fig, im, ax):
 
 @torch.no_grad()
 def _plot_prediction(model, dataset, device, out_dir, sample_idx=0, resolution=256,
-                     filename='prediction_sample.png'):
+                     filename='prediction_sample.png', tta=False):
     """
     2-row figure, ncols = max(n_input_channels, 3):
       Row 0: one panel per input channel
-      Row 1: ground truth DRV | predicted DRV | absolute error  (rest hidden)
+      Row 1: ground truth DRV | predicted DRV | absolute error
     """
     _INPUT_CFG = [
         ('Input: Pin Density', 'viridis'),
         ('Input: AP',          'plasma'),
-        ('Input: Stripe',      'Blues'),
         ('Input: Cell-Type',   'RdPu'),
+        ('Input: AOI/OAI',     'YlOrRd'),
+        ('Input: RUDY',        'OrRd'),
     ]
 
     model.eval()
     x, y = dataset[sample_idx]
     if resolution != 256:
         x, y = _resize(x, y, resolution)
-    pred = model(x.unsqueeze(0).to(device)).squeeze(0)  # (1,H,W)
+    x = x.to(device)
+    pred = tta_predict(model, x) if tta else model(x.unsqueeze(0)).squeeze(0)
 
     x_np    = x.cpu().numpy()       # (C,H,W)
     y_np    = y.cpu().numpy()[0]    # (H,W)
@@ -523,7 +645,8 @@ def _plot_prediction(model, dataset, device, out_dir, sample_idx=0, resolution=2
     fig.suptitle(
         f'{name}\n'
         f'MSE={m["mse"]:.5f}  RMSE={m["rmse"]:.5f}  MAE={m["mae"]:.5f}  '
-        f'Corr={m["corr"]:.4f}  DRV-MSE={m["drv_mse"]:.5f}  DRV-MAE={m["drv_mae"]:.5f}',
+        f'NRMS={m["nrms"]:.4f}  Corr={m["corr"]:.4f}  SSIM={m["ssim"]:.4f}  '
+        f'DRV-MSE={m["drv_mse"]:.5f}  DRV-MAE={m["drv_mae"]:.5f}',
         color='white', fontsize=11, y=1.02, linespacing=1.5)
     plt.tight_layout()
 
@@ -534,12 +657,12 @@ def _plot_prediction(model, dataset, device, out_dir, sample_idx=0, resolution=2
 
 
 def _plot_curves(history, out_path):
-    """2×3 grid of training curves."""
-    keys   = ['loss',  'mse',  'rmse', 'mae',  'corr',    'drv_mse']
-    titles = ['Loss',  'MSE',  'RMSE', 'MAE',  'Pearson Corr', 'DRV-region MSE']
-    colors = ['#00e5ff', '#ff6d00', '#76ff03', '#e040fb', '#ffea00', '#ff1744']
+    """3×3 grid of training curves."""
+    keys   = ['loss',  'mse',  'rmse', 'mae',  'nrms',  'corr',         'ssim',  'drv_mse',       'drv_mae']
+    titles = ['Loss',  'MSE',  'RMSE', 'MAE',  'NRMS',  'Pearson Corr', 'SSIM',  'DRV-region MSE','DRV-region MAE']
+    colors = ['#00e5ff','#ff6d00','#76ff03','#e040fb','#ff9100','#ffea00','#69ff47','#ff1744',      '#f50057']
 
-    fig, axes = plt.subplots(2, 3, figsize=(18, 10))
+    fig, axes = plt.subplots(3, 3, figsize=(18, 15))
     fig.patch.set_facecolor(_DARK)
 
     for ax, key, title, color in zip(axes.ravel(), keys, titles, colors):
@@ -569,7 +692,7 @@ def _plot_curves(history, out_path):
 def _parser():
     base = os.path.dirname(os.path.abspath(__file__))
     p = argparse.ArgumentParser()
-    p.add_argument('--processed_dir', default=os.path.join(base, 'data', 'processed'))
+    p.add_argument('--processed_dir', default=os.path.join(base, 'processed'))
     p.add_argument('--out_dir',       default=None,
                    help='Output directory (default: results/res<N>)')
     p.add_argument('--resolution', type=int, default=256, choices=[32, 64, 128, 256],
@@ -581,10 +704,25 @@ def _parser():
     p.add_argument('--base_ch',    type=int,   default=16,
                    help='U-Net base channel count (default 16 → ~1.9M params)')
     p.add_argument('--dropout',    type=float, default=0.3)
+    p.add_argument('--norm',       type=str,   default='instance',
+                   choices=['instance', 'batch'],
+                   help='Normalization layer: instance (default) or batch')
+    p.add_argument('--features',   type=str,
+                   default='pin_density,ap,cell_type,aoi,rudy',
+                   help='Comma-separated input feature channels')
     p.add_argument('--loss_alpha', type=float, default=20.0,
                    help='Weight multiplier for DRV hotspot bins in the loss')
     p.add_argument('--log_every',  type=int,   default=10)
     p.add_argument('--seed',       type=int,   default=42)
+    p.add_argument('--holdout_designs', type=str, default='seed,cast',
+                   help='Comma-separated design names to hold out as unseen test set')
+    p.add_argument('--exclude_designs', type=str, default='data_syn2_',
+                   help='Comma-separated substring patterns to drop from training '
+                        '(matched against sample filename). E.g. '
+                        '"data_syn2_,data_aes_0" excludes syn2 duplicates and '
+                        'dense-DRV aes outliers without touching aes_cipher_top.')
+    p.add_argument('--tta', action='store_true',
+                   help='Use test-time augmentation (8× D4 symmetry) during evaluation')
     return p
 
 
@@ -604,8 +742,12 @@ if __name__ == '__main__':
     print(f"  epochs        : {args.epochs}")
     print(f"  batch_size    : {args.batch_size}")
     print(f"  lr            : {args.lr}  weight_decay={args.weight_decay}")
-    print(f"  base_ch       : {args.base_ch}  dropout={args.dropout}")
+    print(f"  features      : {args.features}")
+    print(f"  base_ch       : {args.base_ch}  dropout={args.dropout}  norm={args.norm}")
     print(f"  loss_alpha    : {args.loss_alpha}")
+    print(f"  holdout       : {args.holdout_designs}")
+    print(f"  exclude       : {args.exclude_designs}")
+    print(f"  tta           : {args.tta}")
     print("=" * 65 + "\n")
 
     train(args)
