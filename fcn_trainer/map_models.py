@@ -653,11 +653,15 @@ class PlacementMapDataset(Dataset):
         input_keys=('pin_density', 'ap', 'cell_type', 'aoi', 'rudy'),
         target_key='drv',
         transform=None,
+        drv_norm='log',
+        drv_ref=1000,
     ):
         self.files      = sorted(glob.glob(os.path.join(processed_dir, '*.pt')))
         self.input_idx  = [self._KEY_IDX[k] for k in input_keys]
         self.target_idx = self._KEY_IDX[target_key]
         self.transform  = transform
+        self.drv_norm   = drv_norm    # 'log' | 'max'
+        self.drv_ref    = drv_ref     # reference count for log normalisation
 
         if not self.files:
             raise FileNotFoundError(
@@ -679,6 +683,17 @@ class PlacementMapDataset(Dataset):
         x  = x / mx
         if self.transform is not None:
             x = self.transform(x)
+        # DRV target normalisation.
+        # 'max'  (legacy): y is already stored normalised to peak = 1.0;
+        #         every design looks equally severe → model can't distinguish.
+        # 'log'  (default): scale y by log(1 + n_drv) / log(1 + drv_ref) so
+        #         a design with 300 violations peaks near 0.85 and one with
+        #         20 violations peaks near 0.43, giving the model severity signal.
+        if self.drv_norm == 'log':
+            n_drv = data['meta'].get('n_drv', self.drv_ref)
+            import math
+            scale = math.log1p(n_drv) / math.log1p(self.drv_ref)
+            y = y * scale
         return x, y
 
     def sample_name(self, idx):

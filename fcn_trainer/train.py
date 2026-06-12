@@ -376,7 +376,8 @@ def train(args):
 
     # ── data ─────────────────────────────────────────────────────────────────
     input_keys = tuple(k.strip() for k in args.features.split(','))
-    base_ds = PlacementMapDataset(args.processed_dir, input_keys=input_keys)
+    base_ds = PlacementMapDataset(args.processed_dir, input_keys=input_keys,
+                                  drv_norm=args.drv_norm, drv_ref=args.drv_ref)
     in_ch   = len(base_ds.input_idx)
 
     # Hold out all seed + cast samples for testing (never seen during training)
@@ -710,6 +711,13 @@ def _parser():
     p.add_argument('--features',   type=str,
                    default='pin_density,ap,cell_type,aoi,rudy',
                    help='Comma-separated input feature channels')
+    p.add_argument('--drv_norm',   type=str,   default='log',
+                   choices=['log', 'max'],
+                   help='DRV target normalisation: '
+                        'log = scale by log(1+n_drv)/log(1+drv_ref) to encode severity; '
+                        'max = legacy, every design peaks at 1.0')
+    p.add_argument('--drv_ref',    type=int,   default=1000,
+                   help='Reference DRV count for log normalisation (default=drv_limit=1000)')
     p.add_argument('--loss_alpha', type=float, default=20.0,
                    help='Weight multiplier for DRV hotspot bins in the loss')
     p.add_argument('--log_every',  type=int,   default=10)
@@ -743,6 +751,7 @@ if __name__ == '__main__':
     print(f"  batch_size    : {args.batch_size}")
     print(f"  lr            : {args.lr}  weight_decay={args.weight_decay}")
     print(f"  features      : {args.features}")
+    print(f"  drv_norm      : {args.drv_norm}  (drv_ref={args.drv_ref})")
     print(f"  base_ch       : {args.base_ch}  dropout={args.dropout}  norm={args.norm}")
     print(f"  loss_alpha    : {args.loss_alpha}")
     print(f"  holdout       : {args.holdout_designs}")
