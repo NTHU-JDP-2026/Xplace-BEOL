@@ -22,6 +22,7 @@ PyTorch Dataset
 import argparse
 import glob
 import json
+import math
 import os
 import re
 
@@ -356,7 +357,7 @@ class DRVMapModel(nn.Module):
     (σ = drv_sigma_bins / G).  Normalised to [0, 1].
     """
 
-    def __init__(self, violations, die, grid_size=256, drv_sigma_bins=5.0):
+    def __init__(self, violations, die, grid_size=256, drv_sigma_bins=10.0):
         super().__init__()
         x0, y0, x1, y1 = die
         die_w = x1 - x0
@@ -390,7 +391,7 @@ def build_maps(
     grid_size=256,
     cell_smooth_factor=1.5,
     cell_min_sigma_bins=1.0,
-    drv_sigma_bins=1.5,
+    drv_sigma_bins=10.0,
     verbose=True,
 ):
     """
@@ -691,7 +692,6 @@ class PlacementMapDataset(Dataset):
         #         20 violations peaks near 0.43, giving the model severity signal.
         if self.drv_norm == 'log':
             n_drv = data['meta'].get('n_drv', self.drv_ref)
-            import math
             scale = math.log1p(n_drv) / math.log1p(self.drv_ref)
             y = y * scale
         return x, y
@@ -788,7 +788,7 @@ def _make_parser():
     p.add_argument('--grid_size',  type=int,   default=256)
     p.add_argument('--cell_smooth_factor',  type=float, default=1.0)
     p.add_argument('--cell_min_sigma_bins', type=float, default=1.0)
-    p.add_argument('--drv_sigma_bins',      type=float, default=5.0)
+    p.add_argument('--drv_sigma_bins',      type=float, default=10.0)
     return p
 
 

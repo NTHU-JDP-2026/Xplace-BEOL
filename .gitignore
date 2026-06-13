@@ -19,3 +19,9 @@ data/cad
 data/raw
 misc
 .venv/
+fcn_trainer/data
+fcn_trainer/results
+fcn_trainer/exp
+claude.md
+memory.md
+train_data

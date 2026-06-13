@@ -2,24 +2,25 @@
 """
 Train a U-Net to predict DRV density maps from placement feature maps.
 
-Input  : (5, 256, 256) – [pin_density, ap, cell_type, aoi, rudy]
-Output : (1, 256, 256) – predicted DRV map
+Input  : (5, H, H) – [pin_density, ap, cell_type, aoi, rudy]  (H = --resolution)
+Output : (1, H, H) – predicted DRV map
 
-Architecture choice: U-Net
-  • Dense prediction (pixel → pixel) with skip connections
-  • Multi-scale feature capture through encoder-decoder
-  • Naturally handles spatial correlation of placement → DRV
-  • Works well on small datasets compared to plain FCN
+Architecture: U-Net with 4 encoder levels + bottleneck + 4 decoder levels.
+  InstanceNorm2d (affine=True) for design-agnostic normalisation.
+  Dropout2d on deep encoder / bottleneck / decoder for cross-design generalisation.
 
-Loss: Weighted MSE + MAE (weight = 1 + α·gt)
-  • DRV maps are ~88% near-zero; pure MSE would reward predicting all-zeros
-  • Hot spots are up-weighted by factor (1 + alpha) to counteract sparsity
+Loss: Weighted MSE + MAE  (weight = 1 + α·target)
+  DRV maps are ~88% near-zero; plain MSE rewards predicting all-zeros.
+  Hot spots are up-weighted by (1 + alpha) to counteract sparsity.
 
-Usage
------
-    python train.py                          # defaults
-    python train.py --epochs 300 --lr 3e-4
-    python train.py --processed_dir /path/to/processed --out_dir /path/to/results
+Validated best config (test corr ~0.74, train-test gap ~0.02)
+-------------------------------------------------------------
+    python train.py \\
+        --resolution 128 --base_ch 8 --dropout 0.4 \\
+        --epochs 600 --batch_size 16 --weight_decay 5e-3
+
+    TTA (8× D4 symmetry) is enabled by default; pass --no-tta to disable.
+    Use --processed_dir / --out_dir to override default paths.
 """
 
 import argparse
@@ -187,7 +188,7 @@ class UNet(nn.Module):
       dec4–dec2   : dropout      (decoder — main source of design memorization)
       dec1        : 0            (final upsampling, keep spatial detail)
 
-    Default base_ch=16 → ~1.9M parameters.
+    Default base_ch=8 → ~475K parameters; use base_ch=16 for ~1.9M.
     """
 
     def __init__(self, in_ch=3, base_ch=16, dropout=0.3, norm='instance'):
@@ -696,15 +697,15 @@ def _parser():
     p.add_argument('--processed_dir', default=os.path.join(base, 'processed'))
     p.add_argument('--out_dir',       default=None,
                    help='Output directory (default: results/res<N>)')
-    p.add_argument('--resolution', type=int, default=256, choices=[32, 64, 128, 256],
+    p.add_argument('--resolution', type=int, default=128, choices=[32, 64, 128, 256],
                    help='Training resolution. 256×256 .pt maps are downsampled on-the-fly.')
-    p.add_argument('--epochs',     type=int,   default=300)
-    p.add_argument('--batch_size', type=int,   default=8)
+    p.add_argument('--epochs',     type=int,   default=600)
+    p.add_argument('--batch_size', type=int,   default=16)
     p.add_argument('--lr',         type=float, default=1e-3)
-    p.add_argument('--weight_decay', type=float, default=1e-3)
-    p.add_argument('--base_ch',    type=int,   default=16,
-                   help='U-Net base channel count (default 16 → ~1.9M params)')
-    p.add_argument('--dropout',    type=float, default=0.3)
+    p.add_argument('--weight_decay', type=float, default=5e-3)
+    p.add_argument('--base_ch',    type=int,   default=8,
+                   help='U-Net base channel count (default 8 → ~475K params; 16 → ~1.9M)')
+    p.add_argument('--dropout',    type=float, default=0.4)
     p.add_argument('--norm',       type=str,   default='instance',
                    choices=['instance', 'batch'],
                    help='Normalization layer: instance (default) or batch')
@@ -729,8 +730,10 @@ def _parser():
                         '(matched against sample filename). E.g. '
                         '"data_syn2_,data_aes_0" excludes syn2 duplicates and '
                         'dense-DRV aes outliers without touching aes_cipher_top.')
-    p.add_argument('--tta', action='store_true',
-                   help='Use test-time augmentation (8× D4 symmetry) during evaluation')
+    p.add_argument('--tta',    dest='tta', action='store_true',  default=True,
+                   help='Test-time augmentation: 8× D4 symmetry average (default: on)')
+    p.add_argument('--no-tta', dest='tta', action='store_false',
+                   help='Disable test-time augmentation')
     return p
 
 
