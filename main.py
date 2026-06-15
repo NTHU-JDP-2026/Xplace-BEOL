@@ -71,6 +71,19 @@ def get_option():
     parser.add_argument('--eval_engine', type=str, default="ntuplace4dr", help='choose eval engine')
     parser.add_argument('--final_route_eval', type=str2bool, default=False, help='eval placement solution by GR')
 
+    # DRV prediction (fcn_trainer U-Net inference inside GP loop)
+    parser.add_argument('--drv_checkpoint', type=str, default='',
+                        help='Path to fcn_trainer best_model.pt. Empty = disabled.')
+    parser.add_argument('--drv_pred_overflow', type=float, default=0.3,
+                        help='Start DRV prediction when GP overflow drops below this value.')
+    parser.add_argument('--drv_pred_freq', type=int, default=10,
+                        help='Run DRV prediction every N GP iterations (after threshold).')
+    parser.add_argument('--drv_pred_resolution', type=int, default=128,
+                        help='Feature-map resolution for DRV prediction (must match training).')
+    parser.add_argument('--drv_ap_json', type=str, default='',
+                        help='Comma-separated AP JSON paths for the ap channel. '
+                             'Empty = fall back to pin-density weighting.')
+
     # logging and saver
     parser.add_argument('--log_freq', type=int, default=100)
     parser.add_argument('--verbose_cpp_log', type=str2bool, default=False, help='verbose cpp log for debugging')

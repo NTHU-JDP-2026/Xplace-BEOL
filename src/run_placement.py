@@ -42,4 +42,5 @@ def run_placement_main(args, logger):
     if args.run_all:
         run_placement_all(args, logger)
     else:
+        print("Run single design:  %s." % args.design_name)
         run_placement_single(args, logger)

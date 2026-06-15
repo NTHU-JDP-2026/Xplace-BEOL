@@ -1,6 +1,8 @@
 from utils import *
 from src import *
 from functools import partial
+from src.drv_feature_maps import build_drv_feature_maps, load_ap_lookup
+from src.drv_predictor import DRVPredictor
 
 def get_trunc_node_pos_fn(mov_node_size, data):
     node_pos_lb = mov_node_size / 2 + data.die_ll + 1e-4 
@@ -10,7 +12,7 @@ def get_trunc_node_pos_fn(mov_node_size, data):
         return x
     return trunc_node_pos_fn
 
-def global_placement_main(gpdb, rawdb, ps: ParamScheduler, data: PlaceData, args, logger, params, gputimer=None):
+def global_placement_main(gpdb, rawdb, ps: ParamScheduler, data: PlaceData, args, logger, params, gputimer=None, drv_predictor=None):
     init_density_map = data.init_density_map
     if not args.global_placement:
         logger.info("Global placement is switched off. Please make sure the input "
@@ -327,6 +329,18 @@ def global_placement_main(gpdb, rawdb, ps: ParamScheduler, data: PlaceData, args
                 )
                 ps.reset_best_sol()
 
+        # ── DRV prediction (late GP stage only) ──────────────────────────────
+        if drv_predictor is not None and \
+                DRVPredictor.should_predict(overflow, iteration,
+                                            args.drv_pred_overflow,
+                                            args.drv_pred_freq):
+            feat = build_drv_feature_maps(
+                mov_node_pos, data, gpdb,
+                ap_lookup=drv_predictor.ap_lookup,
+                grid_size=args.drv_pred_resolution,
+            )
+            drv_predictor.step(feat, iteration, overflow)
+
         if iteration % args.log_freq == 0 or iteration == args.inner_iter - 1 or log_info:
             log_info = False
             log_str = (
@@ -455,9 +469,27 @@ def run_placement_main_nesterov(args, logger):
             logger.info("early WNS/TNS: %.4f/%.4f (ns) | late WNS/TNS: %.4f/%.4f (ns)" % (wns_early, tns_early, wns_late, tns_late))
             return wns_early, tns_early, wns_late, tns_late
             
+    # ── DRV predictor (optional) ───────────────────────────────────────────────
+    drv_predictor = None
+    if getattr(args, 'drv_checkpoint', '') and os.path.isfile(args.drv_checkpoint):
+        drv_out = os.path.join(
+            args.result_dir, args.exp_id, args.output_dir, 'drv_pred')
+        drv_predictor = DRVPredictor(
+            args.drv_checkpoint, device, drv_out,
+            design_name=args.design_name)
+        ap_paths = [p.strip() for p in args.drv_ap_json.split(',') if p.strip()]
+        drv_predictor.ap_lookup = load_ap_lookup(ap_paths)
+        logger.info(
+            f"DRVPredictor enabled | start_overflow={args.drv_pred_overflow} "
+            f"freq={args.drv_pred_freq} resolution={args.drv_pred_resolution} "
+            f"ap_channels={'yes' if drv_predictor.ap_lookup else 'no (pin-count fallback)'}")
+    elif getattr(args, 'drv_checkpoint', ''):
+        logger.warning(f"DRV checkpoint not found: {args.drv_checkpoint} — prediction disabled")
+
     # global placement
     node_pos, iteration, gp_hpwl, overflow, gp_time, gp_per_iter = global_placement_main(
-        gpdb, rawdb, ps, data, args, logger, params, gputimer
+        gpdb, rawdb, ps, data, args, logger, params, gputimer,
+        drv_predictor=drv_predictor,
     )
     if args.timing_opt:
         wns_early_gp, tns_early_gp, wns_late_gp, tns_late_gp = timing_eval_func(node_pos)
