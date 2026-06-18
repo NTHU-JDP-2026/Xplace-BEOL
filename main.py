@@ -83,6 +83,12 @@ def get_option():
     parser.add_argument('--drv_ap_json', type=str, default='',
                         help='Comma-separated AP JSON paths for the ap channel. '
                              'Empty = fall back to pin-density weighting.')
+    parser.add_argument('--drv_force_weight', type=float, default=0.0,
+                        help='Weight for differentiable DRV gradient force in the Nesterov objective. '
+                             '0 = disabled. Start around 1e-3 and tune relative to density_weight.')
+    parser.add_argument('--drv_grad_ema', type=float, default=0.5,
+                        help='EMA decay for DRV gradient (0=replace every step, 1=never update). '
+                             '0.5 recommended to smooth oscillation.')
 
     # logging and saver
     parser.add_argument('--log_freq', type=int, default=100)

@@ -229,6 +229,7 @@ def global_placement_main(gpdb, rawdb, ps: ParamScheduler, data: PlaceData, args
             for param_group in optimizer.param_groups:
                 param_group["lr"] = cur_lr.item()
             ps.reset_best_sol()
+            ps.drv_grad = None  # stale gradient is invalid after position reset
             terminate_signal = False  # reset signal
             logger.info("Re-run std cell placement with fixed macros.")
 
@@ -269,6 +270,9 @@ def global_placement_main(gpdb, rawdb, ps: ParamScheduler, data: PlaceData, args
 
         if ps.rerun_route:
             log_info = True
+            # Release cached GPU memory before GR to avoid fragmentation from DRV backward passes
+            if ps.drv_grad is not None:
+                torch.cuda.empty_cache()
             new_mov_node_size, new_expand_ratio = None, None
             if ps.use_cell_inflate:
                 output = route_inflation(
@@ -328,8 +332,9 @@ def global_placement_main(gpdb, rawdb, ps: ParamScheduler, data: PlaceData, args
                     )
                 )
                 ps.reset_best_sol()
+                ps.drv_grad = None  # stale gradient is invalid after position/size reset
 
-        # ── DRV prediction (late GP stage only) ──────────────────────────────
+        # ── DRV prediction + force (late GP stage only) ──────────────────────
         if drv_predictor is not None and \
                 DRVPredictor.should_predict(overflow, iteration,
                                             args.drv_pred_overflow,
@@ -340,6 +345,25 @@ def global_placement_main(gpdb, rawdb, ps: ParamScheduler, data: PlaceData, args
                 grid_size=args.drv_pred_resolution,
             )
             drv_predictor.step(feat, iteration, overflow)
+
+            # Compute differentiable DRV force and cache for next Nesterov step.
+            # Gradient points toward higher DRV, so we add it with a positive
+            # drv_weight to steer cells away from high-DRV regions.
+            if ps.drv_weight > 0:
+                new_drv_grad, drv_l2_loss = drv_predictor.compute_force(
+                    mov_node_pos, data, gpdb,
+                    grid_size=args.drv_pred_resolution,
+                )
+                torch.cuda.synchronize()  # surface any async CUDA errors from DRV backward
+                ema = getattr(args, 'drv_grad_ema', 0.5)
+                if ps.drv_grad is None or ps.drv_grad.shape != new_drv_grad.shape:
+                    ps.drv_grad = new_drv_grad
+                else:
+                    ps.drv_grad.mul_(ema).add_(new_drv_grad, alpha=1.0 - ema)
+                logger.info(
+                    "iter: %d | DRV L2 loss: %.4E  grad_norm: %.4E"
+                    % (iteration, drv_l2_loss, ps.drv_grad.norm().item())
+                )
 
         if iteration % args.log_freq == 0 or iteration == args.inner_iter - 1 or log_info:
             log_info = False
@@ -395,12 +419,18 @@ def global_placement_main(gpdb, rawdb, ps: ParamScheduler, data: PlaceData, args
         # rollback macro_pos to previous legalized results since trunc_node_pos_fn may change them
         mov_macros_idx = data.is_mov_macro[mov_lhs:mov_rhs]
         mov_node_pos.data[mov_lhs:mov_rhs][mov_macros_idx] = data.node_pos[mov_lhs:mov_rhs][mov_macros_idx]
+    # Free DRV model from GPU before GR to avoid VRAM contention
+    if drv_predictor is not None:
+        drv_predictor.model.cpu()
+        drv_predictor = None
+        torch.cuda.empty_cache()
+
     if ps.enable_route:
         route_inflation_roll_back(args, logger, data, mov_node_size)
         if not route_early_terminate_signal:
             ps.rerun_route = True
             gr_metrics = run_gr_and_fft_main(
-                args, logger, data, rawdb, gpdb, ps, mov_node_pos, constraint_fn=trunc_node_pos_fn, 
+                args, logger, data, rawdb, gpdb, ps, mov_node_pos, constraint_fn=trunc_node_pos_fn,
                 skip_m1_route=True, report_gr_metrics_only=True, visualize=args.visualize_cgmap
             )
             ps.rerun_route = False

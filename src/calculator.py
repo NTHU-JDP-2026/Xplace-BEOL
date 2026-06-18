@@ -46,7 +46,7 @@ def calc_obj_and_grad(
         wl_loss, conn_node_grad_by_wl = merged_wl_loss_grad(
             conn_node_pos, data.pin_id2node_id, data.pin_rel_cpos,
             data.node2pin_list, data.node2pin_list_end,
-            data.hyperedge_list, data.hyperedge_list_end, data.net_mask, 
+            data.hyperedge_list, data.hyperedge_list_end, data.net_mask,
             data.hpwl_scale, ps.wa_coeff, args.deterministic
         )
         mov_node_pos.grad[mov_lhs:mov_rhs] += conn_node_grad_by_wl[mov_lhs:mov_rhs]
@@ -60,7 +60,7 @@ def calc_obj_and_grad(
             )
             mov_node_pos.grad[mov_lhs:mov_rhs] += conn_node_grad_by_timing[mov_lhs:mov_rhs]
             wl_loss += wl_loss_timing
-            
+
         if ps.enable_sample_force:
             if ps.iter > 3 and ps.iter % 20 == 0:
                 # ps.iter > 3 for warmup
@@ -68,7 +68,7 @@ def calc_obj_and_grad(
                     mov_node_pos, mov_node_size, init_density_map, calc_overflow=False
                 )
                 ps.force_ratio = (
-                    ps.density_weight * node_grad_by_density[mov_lhs:mov_rhs].norm(p=1) / 
+                    ps.density_weight * node_grad_by_density[mov_lhs:mov_rhs].norm(p=1) /
                     conn_node_grad_by_wl[mov_lhs:mov_rhs].norm(p=1)
                 ).clamp_(max=10)
                 mov_node_pos.grad += node_grad_by_density * ps.density_weight
@@ -85,6 +85,14 @@ def calc_obj_and_grad(
 
         if ps.zero_macro_grad:
             mov_node_pos.grad[mov_lhs:mov_rhs].masked_fill_(data.is_mov_macro[mov_lhs:mov_rhs].unsqueeze(1), 0)
+
+        if ps.drv_grad is not None and ps.drv_weight > 0:
+            # Normalise DRV gradient to density gradient magnitude so drv_weight
+            # is a dimensionless ratio (1.0 = same force as density).
+            density_grad_norm = node_grad_by_density[mov_lhs:mov_rhs].norm(p=1).clamp(min=1e-9)
+            drv_grad_norm = ps.drv_grad[mov_lhs:mov_rhs].norm(p=1).clamp(min=1e-9)
+            scale = density_grad_norm / drv_grad_norm
+            mov_node_pos.grad += ps.drv_grad * (ps.drv_weight * ps.density_weight * scale)
 
         grad = apply_precond(mov_node_pos, ps, args)
         loss = wl_loss + ps.density_weight * density_loss

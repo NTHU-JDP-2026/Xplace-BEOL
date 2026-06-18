@@ -41,6 +41,7 @@ class DRVPredictor:
         self.model, self.epoch, self.best_loss = self._load(checkpoint_path)
         print(f"[DRVPredictor] Loaded checkpoint '{checkpoint_path}' "
               f"(epoch={self.epoch}, best_loss={self.best_loss:.5f})")
+        self._grid_size = None  # set from args at call time
 
         # Try to import matplotlib for visualisation — not required
         self._has_mpl = False
@@ -62,6 +63,8 @@ class DRVPredictor:
         model   = UNet(in_ch=in_ch, base_ch=base_ch).to(self.device)
         model.load_state_dict(sd)
         model.eval()
+        for p in model.parameters():   # frozen — we never update weights here
+            p.requires_grad_(False)
         return model, ckpt.get('epoch', '?'), ckpt.get('loss', float('nan'))
 
     # ── Prediction ─────────────────────────────────────────────────────────────
@@ -82,6 +85,38 @@ class DRVPredictor:
     def should_predict(overflow, iteration, start_overflow=0.3, freq=10):
         """True when overflow is below threshold AND iteration is a multiple of freq."""
         return overflow < start_overflow and iteration % freq == 0
+
+    # ── Differentiable force computation ──────────────────────────────────────
+
+    def compute_force(self, mov_node_pos, data, gpdb, grid_size=128):
+        """
+        Run a differentiable forward pass and return dL/d(mov_node_pos).
+
+        Loss = mean(DRV_pred²).  The gradient points toward higher DRV; adding
+        it with a positive drv_weight pushes cells away from high-DRV regions.
+        L2 penalises hotspots quadratically — cells near severe violations feel
+        a much stronger force than those in low-DRV regions.
+
+        Model weights are frozen; only mov_node_pos accumulates gradient.
+
+        Returns:
+            grad : (N_pos, 2) float32 gradient tensor, detached.
+            loss : scalar float — the L2 DRV loss value for logging.
+        """
+        from .drv_feature_maps_diff import build_drv_feature_maps_diff
+
+        pos_leaf = mov_node_pos.detach().requires_grad_(True)
+        feat = build_drv_feature_maps_diff(
+            pos_leaf, data, gpdb,
+            ap_lookup=self.ap_lookup,
+            grid_size=grid_size,
+        )
+        drv_pred = self.model(feat.unsqueeze(0))   # (1, 1, H, W); model params frozen
+        loss = drv_pred.pow(2).mean()
+        loss.backward()
+
+        grad = pos_leaf.grad.detach().clone()
+        return grad, loss.item()
 
     # ── One full predict + save step ───────────────────────────────────────────
 

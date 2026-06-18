@@ -122,6 +122,10 @@ class ParamScheduler:
         self.enable_sample_force = args.enable_sample_force
         self.force_ratio = 0.0
 
+        # DRV force (differentiable DRV-map prediction → gradient guide)
+        self.drv_weight = getattr(args, 'drv_force_weight', 0.0)
+        self.drv_grad: "torch.Tensor | None" = None   # cached; updated externally
+
         self.enable_fence = data.enable_fence
 
         # routability parameter
