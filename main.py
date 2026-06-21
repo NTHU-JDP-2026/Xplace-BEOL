@@ -86,6 +86,9 @@ def get_option():
     parser.add_argument('--drv_force_weight', type=float, default=0.0,
                         help='Weight for differentiable DRV gradient force in the Nesterov objective. '
                              '0 = disabled. Start around 1e-3 and tune relative to density_weight.')
+    parser.add_argument('--drv_finetune_iters', type=int, default=0,
+                        help='Number of DRV fine-tuning iterations after GP convergence. '
+                             '0 = disabled. DRV force is only applied in this phase, not during main GP.')
     parser.add_argument('--drv_grad_ema', type=float, default=0.5,
                         help='EMA decay for DRV gradient (0=replace every step, 1=never update). '
                              '0.5 recommended to smooth oscillation.')

@@ -5,7 +5,7 @@ from src.drv_feature_maps import build_drv_feature_maps, load_ap_lookup
 from src.drv_predictor import DRVPredictor
 
 def get_trunc_node_pos_fn(mov_node_size, data):
-    node_pos_lb = mov_node_size / 2 + data.die_ll + 1e-4 
+    node_pos_lb = mov_node_size / 2 + data.die_ll + 1e-4
     node_pos_ub = data.die_ur - mov_node_size / 2 + data.die_ll - 1e-4
     def trunc_node_pos_fn(x):
         x.data.clamp_(min=node_pos_lb, max=node_pos_ub)
@@ -97,8 +97,8 @@ def global_placement_main(gpdb, rawdb, ps: ParamScheduler, data: PlaceData, args
 
     # initialization
     init_params(
-        mov_node_pos, trunc_node_pos_fn, mov_lhs, mov_rhs, conn_fix_node_pos, 
-        density_map_layer, mov_node_size, expand_ratio, init_density_map, optimizer, 
+        mov_node_pos, trunc_node_pos_fn, mov_lhs, mov_rhs, conn_fix_node_pos,
+        density_map_layer, mov_node_size, expand_ratio, init_density_map, optimizer,
         ps, data, args, route_fn=calc_route_force
     )
     # init learnig rate
@@ -150,7 +150,7 @@ def global_placement_main(gpdb, rawdb, ps: ParamScheduler, data: PlaceData, args
         if args.timing_opt and iteration > args.timing_start_iter and iteration % 1 == 0:
             ps.enable_timing = True
             node_pos = torch.cat([mov_node_pos[mov_lhs:mov_rhs].clone(), data.node_pos[mov_rhs:]], dim=0)
-            
+
             if args.calibration and ps.recorder.overflow[-1] < timing_cali_thrs_overflow:
                 gputimer.update_timing_calibrated(node_pos, record=True)
                 timing_cali_thrs_overflow -= args.calibration_step
@@ -159,11 +159,11 @@ def global_placement_main(gpdb, rawdb, ps: ParamScheduler, data: PlaceData, args
                 gputimer.update_timing_calibrated(node_pos)
             else:
                 gputimer.update_timing(node_pos)
-            
+
             timing_metrics = gputimer.report_timing_slack()
             wns_early, tns_early, wns_late, tns_late = timing_metrics
             ps.push_timing_sol(timing_metrics, hpwl, overflow, mov_node_pos)
-            
+
             if iteration % args.timing_freq == 0:
                 gputimer.step(ps, node_pos, data)
 
@@ -220,8 +220,8 @@ def global_placement_main(gpdb, rawdb, ps: ParamScheduler, data: PlaceData, args
             optimizer = NesterovOptimizer([mov_node_pos], lr=0)
             # initialization
             init_params(
-                mov_node_pos, trunc_node_pos_fn, mov_lhs, mov_rhs, conn_fix_node_pos, 
-                density_map_layer, mov_node_size, expand_ratio, init_density_map, optimizer, 
+                mov_node_pos, trunc_node_pos_fn, mov_lhs, mov_rhs, conn_fix_node_pos,
+                density_map_layer, mov_node_size, expand_ratio, init_density_map, optimizer,
                 ps, data, args, route_fn=calc_route_force
             )
             # init learnig rate
@@ -312,7 +312,7 @@ def global_placement_main(gpdb, rawdb, ps: ParamScheduler, data: PlaceData, args
                 # reset nesterov optimizer
                 optimizer = NesterovOptimizer([mov_node_pos], lr=0)
                 init_params(
-                    mov_node_pos, trunc_node_pos_fn, mov_lhs, mov_rhs, conn_fix_node_pos, 
+                    mov_node_pos, trunc_node_pos_fn, mov_lhs, mov_rhs, conn_fix_node_pos,
                     density_map_layer, mov_node_size, expand_ratio, init_density_map, optimizer,
                     ps, data, args, route_fn=route_fn
                 )
@@ -321,7 +321,7 @@ def global_placement_main(gpdb, rawdb, ps: ParamScheduler, data: PlaceData, args
                     param_group["lr"] = cur_lr.item()
                 logger.info(
                     "Route Iter: %d | lr: %.2E density_weight: %.2E route_weight: %.2E "
-                    "congest_weight: %.2E pseudo_weight: %.2E " 
+                    "congest_weight: %.2E pseudo_weight: %.2E "
                     % (
                         ps.curr_optimizer_cnt - 1,
                         cur_lr.item(),
@@ -334,7 +334,7 @@ def global_placement_main(gpdb, rawdb, ps: ParamScheduler, data: PlaceData, args
                 ps.reset_best_sol()
                 ps.drv_grad = None  # stale gradient is invalid after position/size reset
 
-        # ── DRV prediction + force (late GP stage only) ──────────────────────
+        # ── DRV prediction (Phase 1: visualisation only, no force) ───────────
         if drv_predictor is not None and \
                 DRVPredictor.should_predict(overflow, iteration,
                                             args.drv_pred_overflow,
@@ -345,25 +345,6 @@ def global_placement_main(gpdb, rawdb, ps: ParamScheduler, data: PlaceData, args
                 grid_size=args.drv_pred_resolution,
             )
             drv_predictor.step(feat, iteration, overflow)
-
-            # Compute differentiable DRV force and cache for next Nesterov step.
-            # Gradient points toward higher DRV, so we add it with a positive
-            # drv_weight to steer cells away from high-DRV regions.
-            if ps.drv_weight > 0:
-                new_drv_grad, drv_l2_loss = drv_predictor.compute_force(
-                    mov_node_pos, data, gpdb,
-                    grid_size=args.drv_pred_resolution,
-                )
-                torch.cuda.synchronize()  # surface any async CUDA errors from DRV backward
-                ema = getattr(args, 'drv_grad_ema', 0.5)
-                if ps.drv_grad is None or ps.drv_grad.shape != new_drv_grad.shape:
-                    ps.drv_grad = new_drv_grad
-                else:
-                    ps.drv_grad.mul_(ema).add_(new_drv_grad, alpha=1.0 - ema)
-                logger.info(
-                    "iter: %d | DRV L2 loss: %.4E  grad_norm: %.4E"
-                    % (iteration, drv_l2_loss, ps.drv_grad.norm().item())
-                )
 
         if iteration % args.log_freq == 0 or iteration == args.inner_iter - 1 or log_info:
             log_info = False
@@ -419,6 +400,66 @@ def global_placement_main(gpdb, rawdb, ps: ParamScheduler, data: PlaceData, args
         # rollback macro_pos to previous legalized results since trunc_node_pos_fn may change them
         mov_macros_idx = data.is_mov_macro[mov_lhs:mov_rhs]
         mov_node_pos.data[mov_lhs:mov_rhs][mov_macros_idx] = data.node_pos[mov_lhs:mov_rhs][mov_macros_idx]
+
+    # ── Phase 2: DRV fine-tuning (pure SGD on DRV L2 loss) ────────────────────
+    drv_finetune_iters = getattr(args, 'drv_finetune_iters', 0)
+    if drv_predictor is not None and ps.drv_weight > 0 and drv_finetune_iters > 0:
+        drv_predictor.out_dir = drv_predictor.phase2_out_dir  # switch to phase2 dir
+        logger.info(f"[DRV] Starting fine-tuning phase ({drv_finetune_iters} iters, "
+                    f"drv_weight={ps.drv_weight})")
+        best_ft_loss = float('inf')
+        best_ft_pos = mov_node_pos[mov_lhs:mov_rhs].detach().clone()
+
+        # Calibrate step size from first gradient norm
+        torch.cuda.empty_cache()
+        drv_grad_raw, drv_l2_loss = drv_predictor.compute_force(
+            mov_node_pos, data, gpdb, grid_size=args.drv_pred_resolution)
+        torch.cuda.synchronize()
+        grad_norm = drv_grad_raw[mov_lhs:mov_rhs].norm(p=2).clamp(min=1e-12)
+        # target: move ~1% of die width per step
+        die_width = (data.die_ur - data.die_ll)[0].item()
+        ft_lr = ps.drv_weight * die_width * 0.01 / grad_norm.item()
+        logger.info(f"[DRV] SGD lr={ft_lr:.4E}  grad_norm={grad_norm:.4E}  die_width={die_width:.2f}  DRV_L2={drv_l2_loss:.4E}")
+
+        for ft_i in range(drv_finetune_iters):
+            # Recompute gradient every step (no caching — we're debugging gradient descent)
+            torch.cuda.empty_cache()
+            drv_grad_raw, drv_l2_loss = drv_predictor.compute_force(
+                mov_node_pos, data, gpdb, grid_size=args.drv_pred_resolution)
+            torch.cuda.synchronize()
+
+            # Pure gradient descent update on movable nodes only
+            with torch.no_grad():
+                mov_node_pos[mov_lhs:mov_rhs].data -= ft_lr * drv_grad_raw[mov_lhs:mov_rhs]
+            trunc_node_pos_fn(mov_node_pos)
+
+            if drv_l2_loss < best_ft_loss:
+                best_ft_loss = drv_l2_loss
+                best_ft_pos = mov_node_pos[mov_lhs:mov_rhs].detach().clone()
+
+            if ft_i % 10 == 0:
+                hpwl, overflow = evaluator_fn(mov_node_pos)
+                logger.info(
+                    f"[DRV finetune] {ft_i}/{drv_finetune_iters} | "
+                    f"hpwl={hpwl:.4E} overflow={overflow:.4f} DRV_L2={drv_l2_loss:.4E} lr={ft_lr:.4E}"
+                )
+                feat_vis = build_drv_feature_maps(
+                    mov_node_pos, data, gpdb,
+                    ap_lookup=drv_predictor.ap_lookup,
+                    grid_size=args.drv_pred_resolution,
+                )
+                drv_pred_vis = drv_predictor.step(feat_vis, ft_i, overflow)
+                if drv_predictor._has_mpl:
+                    stem = f"{drv_predictor.design_name}_iter{ft_i:05d}_ovfl{overflow:.3f}"
+                    drv_predictor.save_drv_png(
+                        drv_pred_vis, ft_i, overflow, drv_l2_loss,
+                        os.path.join(drv_predictor.out_dir, stem + '_drv.png'),
+                    )
+
+        mov_node_pos[mov_lhs:mov_rhs].data.copy_(best_ft_pos)
+        ps.drv_grad = None
+        logger.info(f"[DRV] Fine-tuning done. Best DRV L2: {best_ft_loss:.4E}")
+
     # Free DRV model from GPU before GR to avoid VRAM contention
     if drv_predictor is not None:
         drv_predictor.model.cpu()
@@ -448,7 +489,7 @@ def global_placement_main(gpdb, rawdb, ps: ParamScheduler, data: PlaceData, args
     gp_end_time = time.time()
     gp_time = gp_end_time - gp_start_time
     gp_per_iter = gp_time / (iteration + 1)
-    logger.info("GP Stop! #Iters %d masked_hpwl: %.6E overflow: %.4f GP Time: %.4fs perIterTime: %.6fs" % 
+    logger.info("GP Stop! #Iters %d masked_hpwl: %.6E overflow: %.4f GP Time: %.4fs perIterTime: %.6fs" %
         (iteration, hpwl, overflow, gp_time, gp_time / (iteration + 1))
     )
 
@@ -490,7 +531,7 @@ def run_placement_main_nesterov(args, logger):
     ps = ParamScheduler(data, args, logger)
 
     gputimer = None
-    if args.timing_opt:        
+    if args.timing_opt:
         gputimer = GPUTimer(data, rawdb, gpdb, params, args)
         data.gputimer = gputimer
         def timing_eval_func(node_pos):
@@ -498,15 +539,18 @@ def run_placement_main_nesterov(args, logger):
             wns_early, tns_early, wns_late, tns_late = gputimer.report_timing_slack()
             logger.info("early WNS/TNS: %.4f/%.4f (ns) | late WNS/TNS: %.4f/%.4f (ns)" % (wns_early, tns_early, wns_late, tns_late))
             return wns_early, tns_early, wns_late, tns_late
-            
+
     # ── DRV predictor (optional) ───────────────────────────────────────────────
     drv_predictor = None
     if getattr(args, 'drv_checkpoint', '') and os.path.isfile(args.drv_checkpoint):
         drv_out = os.path.join(
-            args.result_dir, args.exp_id, args.output_dir, 'drv_pred')
+            args.result_dir, args.exp_id, args.output_dir, 'drv_pred', 'phase1')
         drv_predictor = DRVPredictor(
             args.drv_checkpoint, device, drv_out,
             design_name=args.design_name)
+        drv_predictor.phase2_out_dir = os.path.join(
+            args.result_dir, args.exp_id, args.output_dir, 'drv_pred', 'phase2')
+        os.makedirs(drv_predictor.phase2_out_dir, exist_ok=True)
         ap_paths = [p.strip() for p in args.drv_ap_json.split(',') if p.strip()]
         drv_predictor.ap_lookup = load_ap_lookup(ap_paths)
         logger.info(
@@ -536,7 +580,7 @@ def run_placement_main_nesterov(args, logger):
     if ps.enable_route and args.final_route_eval:
         logger.info("Final routing evalution by GGR...")
         route_metrics = run_gr_and_fft(
-            args, logger, data, rawdb, gpdb, ps, 
+            args, logger, data, rawdb, gpdb, ps,
             report_gr_metrics_only=True,
             skip_m1_route=True, given_gr_params={
                 "rrrIters": 1,

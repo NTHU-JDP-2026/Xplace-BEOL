@@ -30,12 +30,15 @@ def calc_obj_and_grad(
 
     assert merged_forward_backward
     if merged_forward_backward:
+        wirelength_grad = torch.zeros_like(mov_node_pos)
+        density_grad = torch.zeros_like(mov_node_pos)
+        drv_grad = torch.zeros_like(mov_node_pos)
         if mov_node_pos.grad is not None:
             mov_node_pos.grad.zero_()
         else:
             mov_node_pos.grad = torch.zeros_like(mov_node_pos).detach()
 
-        if ps.use_route_force and ps.start_route_opt:
+        if ps.use_route_force and ps.start_route_opt: # --use_route_force
             mov_route_grad, mov_congest_grad, mov_pseudo_grad = route_fn(
                 mov_node_pos, mov_node_size, expand_ratio, constraint_fn
             )
@@ -49,7 +52,8 @@ def calc_obj_and_grad(
             data.hyperedge_list, data.hyperedge_list_end, data.net_mask,
             data.hpwl_scale, ps.wa_coeff, args.deterministic
         )
-        mov_node_pos.grad[mov_lhs:mov_rhs] += conn_node_grad_by_wl[mov_lhs:mov_rhs]
+        wirelength_grad = conn_node_grad_by_wl[mov_lhs:mov_rhs]
+        mov_node_pos.grad[mov_lhs:mov_rhs] += wirelength_grad[mov_lhs:mov_rhs]
 
         if ps.enable_timing:
             wl_loss_timing, conn_node_grad_by_timing = merged_wl_loss_grad_timing(
@@ -81,7 +85,8 @@ def calc_obj_and_grad(
             density_loss, _, node_grad_by_density = density_map_layer.merged_density_loss_grad(
                 mov_node_pos, mov_node_size, init_density_map, calc_overflow=False
             )
-            mov_node_pos.grad += node_grad_by_density * ps.density_weight
+            density_grad = node_grad_by_density * ps.density_weight
+            mov_node_pos.grad += density_grad
 
         if ps.zero_macro_grad:
             mov_node_pos.grad[mov_lhs:mov_rhs].masked_fill_(data.is_mov_macro[mov_lhs:mov_rhs].unsqueeze(1), 0)

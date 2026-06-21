@@ -130,24 +130,25 @@ class DRVPredictor:
             overflow     : current placement overflow (for filename / title)
         """
         drv_pred = self.predict(feature_maps)           # (1, H, W)
+        l2_loss = drv_pred.pow(2).mean().item()
 
         stem = f"{self.design_name}_iter{iteration:05d}_ovfl{overflow:.3f}"
 
         # Save raw tensor
         pt_path = os.path.join(self.out_dir, stem + '.pt')
         torch.save({'drv_pred': drv_pred.cpu(), 'feature_maps': feature_maps.cpu(),
-                    'iteration': iteration, 'overflow': overflow}, pt_path)
+                    'iteration': iteration, 'overflow': overflow, 'l2_loss': l2_loss}, pt_path)
 
         # Save heatmap
         if self._has_mpl:
-            self._save_png(feature_maps, drv_pred, iteration, overflow,
+            self._save_png(feature_maps, drv_pred, iteration, overflow, l2_loss,
                            os.path.join(self.out_dir, stem + '.png'))
 
         return drv_pred
 
     # ── Visualisation ──────────────────────────────────────────────────────────
 
-    def _save_png(self, feature_maps, drv_pred, iteration, overflow, path):
+    def _save_png(self, feature_maps, drv_pred, iteration, overflow, l2_loss, path):
         import matplotlib.pyplot as plt
 
         feat_np = feature_maps.cpu().numpy()   # (5, H, W)
@@ -172,9 +173,9 @@ class DRVPredictor:
             fig.colorbar(im, ax=ax, fraction=0.046, pad=0.04).ax.tick_params(colors='#aaaaaa', labelsize=6)
 
         ax = axes[-1]
-        im  = ax.imshow(pred_np, origin='lower', cmap='hot', vmin=0, vmax=pred_np.max() or 1,
-                        interpolation='nearest')
-        ax.set_title('DRV Prediction', color='white', fontsize=9)
+        im = ax.imshow(pred_np, origin='lower', cmap='hot', vmin=0, vmax=1,
+                       interpolation='nearest')
+        ax.set_title(f'DRV Prediction  L2={l2_loss:.3f}', color='white', fontsize=9)
         ax.set_facecolor('#12121e')
         ax.tick_params(colors='#888888', labelsize=6)
         fig.colorbar(im, ax=ax, fraction=0.046, pad=0.04).ax.tick_params(colors='#aaaaaa', labelsize=6)
@@ -182,6 +183,26 @@ class DRVPredictor:
         fig.suptitle(
             f'{self.design_name} | iter={iteration} | overflow={overflow:.4f}',
             color='white', fontsize=11, y=1.02)
+        plt.tight_layout()
+        plt.savefig(path, dpi=120, bbox_inches='tight', facecolor=fig.get_facecolor())
+        plt.close()
+
+    def save_drv_png(self, drv_pred, iteration, overflow, l2_loss, path):
+        """Save a standalone DRV prediction heatmap (no feature map panels)."""
+        import matplotlib.pyplot as plt
+
+        pred_np = drv_pred.cpu().numpy()[0]    # (H, W)
+
+        fig, ax = plt.subplots(1, 1, figsize=(5, 5))
+        fig.patch.set_facecolor('#12121e')
+        im = ax.imshow(pred_np, origin='lower', cmap='hot', vmin=0, vmax=1,
+                       interpolation='nearest')
+        ax.set_title(
+            f'DRV  iter={iteration}  ovfl={overflow:.4f}  L2={l2_loss:.3f}',
+            color='white', fontsize=10)
+        ax.set_facecolor('#12121e')
+        ax.tick_params(colors='#888888', labelsize=7)
+        fig.colorbar(im, ax=ax, fraction=0.046, pad=0.04).ax.tick_params(colors='#aaaaaa', labelsize=7)
         plt.tight_layout()
         plt.savefig(path, dpi=120, bbox_inches='tight', facecolor=fig.get_facecolor())
         plt.close()
