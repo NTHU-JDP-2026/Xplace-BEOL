@@ -39,8 +39,13 @@ def get_option():
     parser.add_argument("--mixed_size", type=str2bool, default=False, help="enable mixed size placement")
 
     # global routing params
-    parser.add_argument('--use_m3_snet_density', type=str2bool, default=False, help='add M3 power stripe virtual blockage to density map, reducing available cell capacity in those bins to mitigate PDN routing DRV')
-    parser.add_argument('--m3_density_reduction_factor', type=float, default=0.7, help='[0,1] fraction of target_density available for cells in M3 stripe bins; lower = stronger repulsion (e.g. 0.6 = 40pct capacity reduction)')
+    parser.add_argument('--use_m3_snet_density', type=str2bool, default=False, help='add M3 power stripe virtual blockage to density map, pushing cells away from PDN regions to reduce routing DRV')
+    parser.add_argument('--m3_stripe_density', type=float, default=0.7, help='max allowed cell density in M3 stripe bins [0, target_density]; lower = stronger repulsion (e.g. 0.34 with target_density=0.85 means M3 bins allow at most 34%% cell fill)')
+    parser.add_argument('--m3_stripe_density_min', type=float, default=0.3, help='minimum effective cell density allowed for M3 stripe bins during dynamic DRV-guided density updates')
+    parser.add_argument('--drv_density_update_overflow', type=float, default=0.1, help='overflow threshold below which dynamic M3 density updates are activated')
+    parser.add_argument('--drv_density_update_freq', type=int, default=100, help='run DRV inference and update M3 bin densities every N iterations once activated')
+    parser.add_argument('--drv_density_update_step', type=float, default=0.02, help='amount to reduce effective density per hot M3 bin per update step')
+    parser.add_argument('--drv_density_hot_threshold', type=float, default=0.1, help='DRV prediction value above which an M3 bin is considered a hotspot')
     parser.add_argument('--use_cell_inflate', type=str2bool, default=False, help='use cell inflation')
     parser.add_argument('--min_area_inc', type=float, default=0.01, help='threshold of terminating inflation')
     parser.add_argument('--use_route_force', type=str2bool, default=False, help='use routing force')
@@ -64,8 +69,8 @@ def get_option():
     parser.add_argument('--wire_capacitance_per_micron', type=float, default=0.16e-15, help='unit wire capacitance, normalized across all layers')
 
     # detailed placement and evaluation
-    parser.add_argument('--legalization', type=str2bool, default=True, help='perform lg')
-    parser.add_argument('--detail_placement', type=str2bool, default=True, help='perform dp')
+    parser.add_argument('--legalization', type=str2bool, default=False, help='perform lg')
+    parser.add_argument('--detail_placement', type=str2bool, default=False, help='perform dp')
     parser.add_argument('--dp_engine', type=str, default="default", help='choose dp engine')
     parser.add_argument('--eval_by_external', type=str2bool, default=False, help='eval dp sol by external binary')
     parser.add_argument('--eval_engine', type=str, default="ntuplace4dr", help='choose eval engine')
@@ -74,7 +79,7 @@ def get_option():
     # DRV prediction (fcn_trainer U-Net inference inside GP loop)
     parser.add_argument('--drv_checkpoint', type=str, default='',
                         help='Path to fcn_trainer best_model.pt. Empty = disabled.')
-    parser.add_argument('--drv_pred_overflow', type=float, default=0.3,
+    parser.add_argument('--drv_pred_overflow', type=float, default=0.5,
                         help='Start DRV prediction when GP overflow drops below this value.')
     parser.add_argument('--drv_pred_freq', type=int, default=10,
                         help='Run DRV prediction every N GP iterations (after threshold).')
@@ -89,9 +94,15 @@ def get_option():
     parser.add_argument('--drv_finetune_iters', type=int, default=0,
                         help='Number of DRV fine-tuning iterations after GP convergence. '
                              '0 = disabled. DRV force is only applied in this phase, not during main GP.')
-    parser.add_argument('--drv_grad_ema', type=float, default=0.5,
+    parser.add_argument('--drv_finetune_target_density', type=float, default=-1.0,
+                        help='Target density for Phase 2 DRV fine-tuning. '
+                             '-1 = same as --target_density. Lower value pushes cells further apart.')
+    parser.add_argument('--drv_grad_ema', type=float, default=0.7,
                         help='EMA decay for DRV gradient (0=replace every step, 1=never update). '
                              '0.5 recommended to smooth oscillation.')
+    parser.add_argument('--drv_phase1_vis_freq', type=int, default=100,
+                        help='Run DRV inference for visualisation every N iters during Phase 1 (after drv_pred_overflow). '
+                             '0 = disabled.')
 
     # logging and saver
     parser.add_argument('--log_freq', type=int, default=100)

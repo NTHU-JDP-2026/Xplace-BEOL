@@ -1,6 +1,7 @@
 from utils import *
 from src import *
 from functools import partial
+import torch.nn.functional as F
 from src.drv_feature_maps import build_drv_feature_maps, load_ap_lookup
 from src.drv_predictor import DRVPredictor
 
@@ -56,13 +57,6 @@ def global_placement_main(gpdb, rawdb, ps: ParamScheduler, data: PlaceData, args
         deterministic=args.deterministic,
     ).to(device)
 
-    # fix_lhs, fix_rhs = data.fixed_index
-    # info = (0, 0, data.design_name + "_fix")
-    # fix_node_pos = data.node_pos[fix_lhs:fix_rhs, ...]
-    # fix_node_size = data.node_size[fix_lhs:fix_rhs, ...]
-    # draw_fig_with_cairo(
-    #     None, None, fix_node_pos, fix_node_size, None, None, data, info, args
-    # )
     def calc_route_force(mov_node_pos, mov_node_size, expand_ratio, constraint_fn):
         return get_route_force(
             args, logger, data, rawdb, gpdb, ps, mov_node_pos, mov_node_size, expand_ratio,
@@ -110,40 +104,28 @@ def global_placement_main(gpdb, rawdb, ps: ParamScheduler, data: PlaceData, args
     gp_start_time = time.time()
     logger.info("start gp")
 
-    # def trace_handler(prof):
-    #     print(prof.key_averages().table(
-    #         sort_by="self_cuda_time_total", row_limit=-1))
-    #     prof.export_chrome_trace("test_trace_" + str(prof.step_num) + ".json")
-    # with torch.profiler.profile(
-    #     activities=[
-    #         torch.profiler.ProfilerActivity.CPU,
-    #         torch.profiler.ProfilerActivity.CUDA,
-    #     ], schedule=torch.profiler.schedule(
-    #         wait=2,
-    #         warmup=2,
-    #         active=2),
-    #     on_trace_ready=trace_handler
-    #     ) as p:
-    #         for iter in range(6):
-    #             # optimizer.zero_grad()
-    #             obj = optimizer.step(obj_and_grad_fn)
-    #             hpwl, overflow = evaluator_fn(mov_node_pos)
-    #             # update parameters
-    #             ps.step(hpwl, overflow, mov_node_pos, data)
-    #             if ps.need_to_early_stop():
-    #                 break
-    #             p.step()
-    # exit(0)
+    # ── Dynamic M3 density update state (DSDA) ──────────────────────────────────────
+    m3_stripe_density_min   = getattr(args, 'm3_stripe_density_min', 0.3)
+    drv_density_update_overflow = getattr(args, 'drv_density_update_overflow', 0.1)
+    drv_density_update_freq = getattr(args, 'drv_density_update_freq', 100)
+    drv_density_update_step = getattr(args, 'drv_density_update_step', 0.02)
+    drv_density_hot_threshold = getattr(args, 'drv_density_hot_threshold', 0.1)
+    use_dynamic_density = (
+        getattr(args, 'use_m3_snet_density', False)
+        and drv_predictor is not None
+        and getattr(data, 'm3_bin_mask', None) is not None
+        and getattr(args, 'm3_stripe_density', args.target_density) > m3_stripe_density_min
+    )
+    density_update_active = False
+
     terminate_signal = False
     route_early_terminate_signal = False
     log_info = False
     timing_cali_thrs_overflow = 0.5
     timing_calibration = False
     for iteration in range(args.inner_iter):
-        # optimizer.zero_grad() # zero grad inside obj_and_grad_fn
         obj = optimizer.step(obj_and_grad_fn)
         hpwl, overflow = evaluator_fn(mov_node_pos)
-        # update parameters
         ps.step(hpwl, overflow, mov_node_pos, data)
 
         # Perform timing-opt.
@@ -247,17 +229,6 @@ def global_placement_main(gpdb, rawdb, ps: ParamScheduler, data: PlaceData, args
                 if ps.recorder.overflow[-1] < 0.2 and ps.recorder.overflow[-2] >= 0.2 and not ps.start_route_opt:
                     ps.start_route_opt = True
                     ps.curr_optimizer_cnt += 1
-                # if ps.recorder.overflow[-2] < 0.2 and ps.recorder.overflow[-1] >= 0.2 and ps.start_route_opt:
-                #     ps.start_route_opt = False
-                #     ps.curr_optimizer_cnt += 1
-
-        # if ps.use_cell_inflate and ps.curr_optimizer_cnt < ps.max_route_opt:
-        #     if ps.iter > 100 and ps.enable_route:
-        #         if ps.recorder.overflow[-1] < 0.15 and ps.recorder.overflow[-2] >= 0.15 and not ps.start_route_opt:
-        #             ps.start_route_opt = True
-        #             ps.curr_optimizer_cnt += 1
-        #         if ps.recorder.overflow[-2] < 0.15 and ps.recorder.overflow[-1] >= 0.15 and ps.start_route_opt:
-        #             ps.start_route_opt = False
 
         if ps.start_route_opt and ps.enable_route:
             if (ps.iter % args.route_freq == 0 and ps.use_route_force) or \
@@ -334,17 +305,71 @@ def global_placement_main(gpdb, rawdb, ps: ParamScheduler, data: PlaceData, args
                 ps.reset_best_sol()
                 ps.drv_grad = None  # stale gradient is invalid after position/size reset
 
-        # ── DRV prediction (Phase 1: visualisation only, no force) ───────────
-        if drv_predictor is not None and \
-                DRVPredictor.should_predict(overflow, iteration,
-                                            args.drv_pred_overflow,
-                                            args.drv_pred_freq):
+        # ── DRV prediction (Phase 1: inference only, no force, no PNG) ──────
+        vis_freq = getattr(args, 'drv_phase1_vis_freq', 100)
+        if drv_predictor is not None and vis_freq > 0 and \
+                overflow < args.drv_pred_overflow and iteration % vis_freq == 0:
             feat = build_drv_feature_maps(
                 mov_node_pos, data, gpdb,
                 ap_lookup=drv_predictor.ap_lookup,
                 grid_size=args.drv_pred_resolution,
             )
-            drv_predictor.step(feat, iteration, overflow)
+            drv_pred_vis = drv_predictor.predict(feat)
+            drv_l2_vis = drv_pred_vis.pow(5).mean().item()
+            logger.info(f"[DRV phase1] iter={iteration} overflow={overflow:.4f} DRV_L2={drv_l2_vis:.4E}")
+
+        # ── Dynamic M3 density update (DRV-guided) ───────────────────────────
+        if use_dynamic_density:
+            if not density_update_active and overflow < drv_density_update_overflow:
+                density_update_active = True
+                logger.info(
+                    f"[DensityUpdate] Activated at iter={iteration} overflow={overflow:.4f} "
+                    f"m3_density={getattr(args,'m3_stripe_density',0.7):.2f} -> min={m3_stripe_density_min:.2f}"
+                )
+            if density_update_active and iteration % drv_density_update_freq == 0:
+                with torch.no_grad():
+                    feat_du = build_drv_feature_maps(
+                        mov_node_pos, data, gpdb,
+                        ap_lookup=drv_predictor.ap_lookup,
+                        grid_size=args.drv_pred_resolution,
+                    )
+                    drv_pred_du = drv_predictor.predict(feat_du)  # (1, H, W)
+                    # Resize DRV prediction to bin-grid resolution
+                    drv_bin = F.interpolate(
+                        drv_pred_du.unsqueeze(0),
+                        size=(data.num_bin_x, data.num_bin_y),
+                        mode='bilinear', align_corners=False,
+                    ).squeeze()  # (num_bin_x, num_bin_y)
+                    hot_m3 = data.m3_bin_mask & (drv_bin > drv_density_hot_threshold)
+                    num_hot = hot_m3.sum().item()
+                    if num_hot > 0:
+                        data.m3_bin_effective_density[hot_m3] = (
+                            data.m3_bin_effective_density[hot_m3] - drv_density_update_step
+                        ).clamp(min=m3_stripe_density_min)
+                        new_blockage = (
+                            args.target_density - data.m3_bin_effective_density
+                        ) * data.m3_bin_mask.float()
+                        new_map = (data.base_init_density_map + new_blockage).clamp(
+                            max=args.target_density
+                        )
+                        init_density_map.data.copy_(new_map)
+                    avg_m3_eff = data.m3_bin_effective_density[data.m3_bin_mask].mean().item()
+                    logger.info(
+                        f"[DensityUpdate] iter={iteration} overflow={overflow:.4f} "
+                        f"hot_m3_bins={num_hot} avg_m3_effective_density={avg_m3_eff:.4f}"
+                    )
+                    draw_init_density_map(
+                        init_density_map, data,
+                        (f"{iteration}_du", hpwl, data.design_name),
+                        args,
+                    )
+            # Every 10 iters log M3 effective density average once updates are active
+            if density_update_active and iteration % 10 == 0:
+                avg_m3_eff = data.m3_bin_effective_density[data.m3_bin_mask].mean().item()
+                logger.info(
+                    f"[DensityMap] iter={iteration} avg_m3_effective_density={avg_m3_eff:.4f} "
+                    f"init_density_map_mean={init_density_map.mean().item():.4f}"
+                )
 
         if iteration % args.log_freq == 0 or iteration == args.inner_iter - 1 or log_info:
             log_info = False
@@ -401,47 +426,72 @@ def global_placement_main(gpdb, rawdb, ps: ParamScheduler, data: PlaceData, args
         mov_macros_idx = data.is_mov_macro[mov_lhs:mov_rhs]
         mov_node_pos.data[mov_lhs:mov_rhs][mov_macros_idx] = data.node_pos[mov_lhs:mov_rhs][mov_macros_idx]
 
-    # ── Phase 2: DRV fine-tuning (pure SGD on DRV L2 loss) ────────────────────
+    # ── Phase 2: DRV fine-tuning (SGD on WL + density + DRV) ────────────────────
     drv_finetune_iters = getattr(args, 'drv_finetune_iters', 0)
     if drv_predictor is not None and ps.drv_weight > 0 and drv_finetune_iters > 0:
         drv_predictor.out_dir = drv_predictor.phase2_out_dir  # switch to phase2 dir
         logger.info(f"[DRV] Starting fine-tuning phase ({drv_finetune_iters} iters, "
-                    f"drv_weight={ps.drv_weight})")
-        best_ft_loss = float('inf')
-        best_ft_pos = mov_node_pos[mov_lhs:mov_rhs].detach().clone()
+                    f"drv_weight={ps.drv_weight}, density_weight={ps.density_weight:.4E})")
 
-        # Calibrate step size from first gradient norm
+        # Lower target density for Phase 2 if requested
+        ft_target_density = getattr(args, 'drv_finetune_target_density', -1.0)
+        if ft_target_density < 0:
+            ft_target_density = args.target_density
+        ft_obj_and_grad_fn = obj_and_grad_fn  # default: same as Phase 1
+        if ft_target_density != args.target_density:
+            # Increase init_density_map by the delta so overflow fires earlier,
+            # effectively lowering the available capacity for movable cells.
+            delta = args.target_density - ft_target_density
+            ft_init_density_map = init_density_map + delta
+            ft_obj_and_grad_fn = partial(
+                calc_obj_and_grad,
+                constraint_fn=trunc_node_pos_fn,
+                route_fn=calc_route_force,
+                mov_node_size=mov_node_size,
+                expand_ratio=expand_ratio,
+                init_density_map=ft_init_density_map,
+                density_map_layer=density_map_layer,
+                conn_fix_node_pos=conn_fix_node_pos,
+                ps=ps,
+                data=data,
+                args=args,
+            )
+            logger.info(f"[DRV] Phase 2 target_density={ft_target_density} (delta={delta:.3f})")
+
+        # Compute initial DRV gradient and cache in ps.drv_grad for calc_obj_and_grad
         torch.cuda.empty_cache()
-        drv_grad_raw, drv_l2_loss = drv_predictor.compute_force(
+        ps.drv_grad, drv_l2_loss = drv_predictor.compute_force(
             mov_node_pos, data, gpdb, grid_size=args.drv_pred_resolution)
         torch.cuda.synchronize()
-        grad_norm = drv_grad_raw[mov_lhs:mov_rhs].norm(p=2).clamp(min=1e-12)
-        # target: move ~1% of die width per step
-        die_width = (data.die_ur - data.die_ll)[0].item()
-        ft_lr = ps.drv_weight * die_width * 0.01 / grad_norm.item()
-        logger.info(f"[DRV] SGD lr={ft_lr:.4E}  grad_norm={grad_norm:.4E}  die_width={die_width:.2f}  DRV_L2={drv_l2_loss:.4E}")
+
+        # Reuse Phase 1's final alpha_k as SGD step size
+        phase1_alpha = None
+        if optimizer.param_groups[0]['alpha_k']:
+            phase1_alpha = optimizer.param_groups[0]['alpha_k'][0].item()
+        if phase1_alpha is None or not (phase1_alpha > 0 and phase1_alpha < float('inf')):
+            phase1_alpha = args.lr
+        ft_lr = phase1_alpha
+        logger.info(f"[DRV] SGD lr={ft_lr:.4E}  DRV_L2={drv_l2_loss:.4E}")
 
         for ft_i in range(drv_finetune_iters):
-            # Recompute gradient every step (no caching — we're debugging gradient descent)
-            torch.cuda.empty_cache()
-            drv_grad_raw, drv_l2_loss = drv_predictor.compute_force(
-                mov_node_pos, data, gpdb, grid_size=args.drv_pred_resolution)
-            torch.cuda.synchronize()
+            # Refresh DRV gradient every drv_pred_freq steps
+            if ft_i % args.drv_pred_freq == 0:
+                torch.cuda.empty_cache()
+                ps.drv_grad, drv_l2_loss = drv_predictor.compute_force(
+                    mov_node_pos, data, gpdb, grid_size=args.drv_pred_resolution)
+                torch.cuda.synchronize()
 
-            # Pure gradient descent update on movable nodes only
+            # SGD step: compute WL + density + DRV gradient, then update
+            _, grad = ft_obj_and_grad_fn(mov_node_pos)
             with torch.no_grad():
-                mov_node_pos[mov_lhs:mov_rhs].data -= ft_lr * drv_grad_raw[mov_lhs:mov_rhs]
+                mov_node_pos.data -= ft_lr * grad
             trunc_node_pos_fn(mov_node_pos)
-
-            if drv_l2_loss < best_ft_loss:
-                best_ft_loss = drv_l2_loss
-                best_ft_pos = mov_node_pos[mov_lhs:mov_rhs].detach().clone()
 
             if ft_i % 10 == 0:
                 hpwl, overflow = evaluator_fn(mov_node_pos)
                 logger.info(
                     f"[DRV finetune] {ft_i}/{drv_finetune_iters} | "
-                    f"hpwl={hpwl:.4E} overflow={overflow:.4f} DRV_L2={drv_l2_loss:.4E} lr={ft_lr:.4E}"
+                    f"hpwl={hpwl:.4E} overflow={overflow:.4f} DRV_L2={drv_l2_loss:.4E}"
                 )
                 feat_vis = build_drv_feature_maps(
                     mov_node_pos, data, gpdb,
@@ -451,14 +501,13 @@ def global_placement_main(gpdb, rawdb, ps: ParamScheduler, data: PlaceData, args
                 drv_pred_vis = drv_predictor.step(feat_vis, ft_i, overflow)
                 if drv_predictor._has_mpl:
                     stem = f"{drv_predictor.design_name}_iter{ft_i:05d}_ovfl{overflow:.3f}"
-                    drv_predictor.save_drv_png(
-                        drv_pred_vis, ft_i, overflow, drv_l2_loss,
-                        os.path.join(drv_predictor.out_dir, stem + '_drv.png'),
-                    )
+                    # drv_predictor.save_drv_png(
+                    #     drv_pred_vis, ft_i, overflow, drv_l2_loss,
+                    #     os.path.join(drv_predictor.out_dir, stem + '_drv.png'),
+                    # )
 
-        mov_node_pos[mov_lhs:mov_rhs].data.copy_(best_ft_pos)
         ps.drv_grad = None
-        logger.info(f"[DRV] Fine-tuning done. Best DRV L2: {best_ft_loss:.4E}")
+        logger.info(f"[DRV] Fine-tuning done. Final DRV L2: {drv_l2_loss:.4E}")
 
     # Free DRV model from GPU before GR to avoid VRAM contention
     if drv_predictor is not None:
@@ -492,6 +541,13 @@ def global_placement_main(gpdb, rawdb, ps: ParamScheduler, data: PlaceData, args
     logger.info("GP Stop! #Iters %d masked_hpwl: %.6E overflow: %.4f GP Time: %.4fs perIterTime: %.6fs" %
         (iteration, hpwl, overflow, gp_time, gp_time / (iteration + 1))
     )
+    if use_dynamic_density and getattr(data, 'm3_bin_mask', None) is not None:
+        avg_m3_eff_final = data.m3_bin_effective_density[data.m3_bin_mask].mean().item()
+        logger.info(
+            f"[DensityUpdate] GP end: avg_m3_effective_density={avg_m3_eff_final:.4f} "
+            f"(init={getattr(args,'m3_stripe_density',0.7):.2f} min={m3_stripe_density_min:.2f}) "
+            f"init_density_map_mean={init_density_map.mean().item():.4f}"
+        )
 
     # Eval
     hpwl, overflow = evaluate_placement(node_pos, init_density_map, ps, data, args)
@@ -500,7 +556,9 @@ def global_placement_main(gpdb, rawdb, ps: ParamScheduler, data: PlaceData, args
     if args.draw_placement:
         draw_fig_with_cairo_cpp(node_pos, data.node_size, data, info, args)
         draw_placement_with_pdn(node_pos, data.node_size, gpdb, data, info, args)
-        draw_bin_density_map(node_pos, data.node_size, data, info, args)
+    draw_bin_density_map(node_pos, data.node_size, data, info, args)
+    if getattr(args, 'use_m3_snet_density', False):
+        draw_init_density_map(init_density_map, data, info, args)
     logger.info("After GP, best solution eval, exact HPWL: %.6E exact Overflow: %.4f" % (hpwl, overflow))
     ps.visualize(args, logger)
     gp_hpwl = hpwl

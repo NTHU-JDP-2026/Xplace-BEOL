@@ -7,15 +7,15 @@ from .core import merged_wl_loss_grad, merged_wl_loss_grad_timing
 def _apply_m3_snet_density_reduction(gpdb, data, args, init_density_map, device, logger):
     """Add virtual blockage to bins overlapping M3 power stripes.
 
-    After init_density_map has been scaled by target_density, bins that contain
-    M3 snet segments receive extra density so their effective cell capacity
-    becomes (factor * target_density) instead of target_density.  This pushes
-    cells away from PDN regions and reduces routing DRV near M3 power stripes.
+    M3 stripe bins receive extra density so their effective cell capacity
+    becomes m3_stripe_density instead of target_density, pushing cells away
+    from PDN regions to reduce routing DRV.
     """
-    factor = getattr(args, 'm3_density_reduction_factor', 0.7)
-    if not (0.0 < factor < 1.0):
+    m3_stripe_density = getattr(args, 'm3_stripe_density', 0.7)
+    if not (0.0 <= m3_stripe_density < args.target_density):
         logger.warning(
-            "m3_density_reduction_factor=%.2f is out of (0, 1); skipping M3 density reduction." % factor
+            "m3_stripe_density=%.2f is not in [0, target_density=%.2f); skipping M3 density reduction." % (
+                m3_stripe_density, args.target_density)
         )
         return
 
@@ -45,19 +45,29 @@ def _apply_m3_snet_density_reduction(gpdb, data, args, init_density_map, device,
         -1.0, -1.0, 1e-4, False, args.deterministic,
     ).contiguous()
 
-    # Virtual blockage = (1 - factor) * target_density for bins that have M3 stripe.
-    # After adding this, the remaining capacity for cells becomes factor * target_density.
+    # virtual_blockage fills each M3 bin up to target_density - m3_stripe_density,
+    # leaving only m3_stripe_density of capacity available for movable cells.
     m3_bin_mask = m3_density_map > 0
-    virtual_blockage = m3_bin_mask.float() * (1.0 - factor) * args.target_density
+    virtual_blockage = m3_bin_mask.float() * (args.target_density - m3_stripe_density)
     init_density_map.add_(virtual_blockage).clamp_(max=args.target_density)
+
+    # Expose M3 state on data for dynamic density updates
+    data.m3_bin_mask = m3_bin_mask  # bool (num_bin_x, num_bin_y)
+    data.m3_bin_effective_density = torch.full(
+        (data.num_bin_x, data.num_bin_y), args.target_density,
+        device=device, dtype=init_density_map.dtype
+    )
+    data.m3_bin_effective_density[m3_bin_mask] = m3_stripe_density
 
     num_affected = m3_bin_mask.sum().item()
     total_bins = data.num_bin_x * data.num_bin_y
     logger.info(
-        "M3 snet density reduction: factor=%.2f, affected bins=%d / %d (%.1f%%)" % (
-            factor, num_affected, total_bins, 100.0 * num_affected / total_bins
+        "M3 stripe density: m3_stripe_density=%.2f (target_density=%.2f), affected bins=%d / %d (%.1f%%)" % (
+            m3_stripe_density, args.target_density, num_affected, total_bins,
+            100.0 * num_affected / total_bins
         )
     )
+
 
 
 def get_init_density_map(rawdb, gpdb, data: PlaceData, args, logger, ps=None):
@@ -138,6 +148,7 @@ def get_init_density_map(rawdb, gpdb, data: PlaceData, args, logger, ps=None):
     init_density_map.clamp_(min=0.0, max=1.0).mul_(args.target_density)
 
     if getattr(args, 'use_m3_snet_density', False) and gpdb is not None:
+        data.base_init_density_map = init_density_map.clone()
         _apply_m3_snet_density_reduction(
             gpdb, data, args, init_density_map, device, logger
         )

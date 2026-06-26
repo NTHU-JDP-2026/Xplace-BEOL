@@ -112,7 +112,8 @@ class DRVPredictor:
             grid_size=grid_size,
         )
         drv_pred = self.model(feat.unsqueeze(0))   # (1, 1, H, W); model params frozen
-        loss = drv_pred.pow(2).mean()
+        k = max(1, int(drv_pred.numel() * 0.2))   # worst 20% of grid cells
+        loss = drv_pred.flatten().topk(k).values.mean()
         loss.backward()
 
         grad = pos_leaf.grad.detach().clone()

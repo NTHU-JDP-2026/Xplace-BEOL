@@ -466,6 +466,70 @@ def draw_bin_density_map(node_pos, node_size, data, info, args):
     logging.getLogger(__name__).info("Bin density map saved to %s" % png_path)
 
 
+def draw_init_density_map(init_density_map, data, info, args):
+    """Visualise the effective target-density map (init_density_map).
+
+    Shows the per-bin capacity available to movable cells expressed as the
+    effective allowed density (target_density − blockage per bin).  M3 power
+    stripe bins appear as low-density corridors; dynamically updated bins
+    reflect the DRV-guided reductions applied during placement.
+    """
+    import matplotlib
+    matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
+    import matplotlib.colors as mcolors
+
+    iteration, hpwl, design_name = info
+    filename = "%s_iter%s_init_density.png" % (design_name, iteration)
+    res_root = os.path.join(args.result_dir, args.exp_id)
+    png_path = os.path.join(res_root, args.eval_dir, filename)
+    os.makedirs(os.path.dirname(png_path), exist_ok=True)
+
+    target_density = args.target_density
+    # Effective per-bin capacity: target_density - blockage
+    eff_density = (target_density - init_density_map.float()).clamp(min=0.0)
+    im_data = eff_density.cpu().numpy().T  # (num_bin_y, num_bin_x) for imshow
+
+    lx, hx, ly, hy = data.__ori_die_info__
+
+    fig, ax = plt.subplots(figsize=(10.0, 10.0 * (hy - ly) / (hx - lx)), dpi=100)
+    vmin = float(getattr(args, 'm3_stripe_density_min', im_data.min()))
+    vmax = float(target_density)
+    cmap = plt.cm.RdYlGn  # red = blocked/low capacity, green = full capacity
+    im = ax.imshow(
+        im_data,
+        origin="lower",
+        extent=[lx, hx, ly, hy],
+        cmap=cmap,
+        vmin=vmin,
+        vmax=vmax,
+        aspect="auto",
+        interpolation="nearest",
+    )
+    cbar = fig.colorbar(im, ax=ax, fraction=0.03, pad=0.02)
+    cbar.set_label("Effective cell capacity per bin", fontsize=8)
+    cbar.ax.axhline(y=target_density, color="blue", linewidth=1.5, linestyle="--")
+
+    m3_density = getattr(args, 'm3_stripe_density', None)
+    m3_density_min = getattr(args, 'm3_stripe_density_min', None)
+    subtitle = "M3 stripe density init=%.2f" % m3_density if m3_density is not None else ""
+    if m3_density_min is not None:
+        subtitle += "  min=%.2f" % m3_density_min
+
+    ax.set_title(
+        "%s  iter%s  HPWL=%.2E\n"
+        "Effective target density (capacity for movable cells)  |  target=%.2f  bins=%dx%d\n%s"
+        % (design_name, iteration, hpwl, target_density, data.num_bin_x, data.num_bin_y, subtitle),
+        fontsize=8,
+    )
+    ax.set_xlabel("X (DB units)")
+    ax.set_ylabel("Y (DB units)")
+    plt.tight_layout()
+    plt.savefig(png_path, bbox_inches="tight", dpi=100)
+    plt.close(fig)
+    logging.getLogger(__name__).info("Init density map saved to %s" % png_path)
+
+
 def draw_grad_abs_mean(
     wl_grads, density_grads, iterations, info, args,
 ):
