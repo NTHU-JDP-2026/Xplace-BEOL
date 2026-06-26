@@ -26,6 +26,7 @@ Validated best config (test corr ~0.74, train-test gap ~0.02)
 import argparse
 import os
 import random
+import re
 
 import numpy as np
 import torch
@@ -343,12 +344,21 @@ def batch_metrics(pred, target, drv_threshold=0.1):
 # Training loop
 # ──────────────────────────────────────────────────────────────────────────────
 
+_DESIGN_RE = re.compile(r'^data_(.+?)(?:_[\d.]+)+(?:_[Tt]rue|_[Ff]alse)?\.pt$')
+
+def _extract_design(filename):
+    """Extract the design name from a .pt filename (exact, not substring)."""
+    m = _DESIGN_RE.match(filename)
+    return m.group(1) if m else filename
+
+
 def _pick_test_indices(dataset, holdout_designs=('seed', 'cast')):
-    """Return all indices whose filename matches any of the holdout_designs."""
+    """Return all indices whose extracted design name is exactly in holdout_designs."""
+    holdout_set = set(holdout_designs)
     test_idx = []
     for i, f in enumerate(dataset.files):
-        name = os.path.basename(f)
-        if any(f'data_{d}_' in name for d in holdout_designs):
+        design = _extract_design(os.path.basename(f))
+        if design in holdout_set:
             test_idx.append(i)
     return test_idx
 
