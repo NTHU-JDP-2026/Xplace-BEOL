@@ -38,6 +38,6 @@ docker exec compassionate_pascal bash -c \
   --drv_density_update_overflow 0.25 \
   --drv_density_update_step 0.05 \
   --drv_density_update_freq 5  \
-  --drv_density_hot_threshold 0.08 \
+  --drv_density_hot_threshold 0.05 \
   --drv_ap_json fcn_trainer/SL_modified_m2_ap.json,fcn_trainer/L_modified_m2_ap.json" 2>&1
 

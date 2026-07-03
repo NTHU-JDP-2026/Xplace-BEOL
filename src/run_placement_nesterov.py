@@ -117,6 +117,7 @@ def global_placement_main(gpdb, rawdb, ps: ParamScheduler, data: PlaceData, args
         and getattr(args, 'm3_stripe_density', args.target_density) > m3_stripe_density_min
     )
     density_update_active = False
+    density_update_count = 0
 
     terminate_signal = False
     route_early_terminate_signal = False
@@ -333,13 +334,14 @@ def global_placement_main(gpdb, rawdb, ps: ParamScheduler, data: PlaceData, args
                         ap_lookup=drv_predictor.ap_lookup,
                         grid_size=args.drv_pred_resolution,
                     )
-                    drv_pred_du = drv_predictor.predict(feat_du)  # (1, H, W)
-                    # Resize DRV prediction to bin-grid resolution
+                    drv_pred_du = drv_predictor.predict(feat_du)  # (1, y, x)
+                    # Resize to bin-grid and transpose: DRV pred is [y,x] but
+                    # m3_bin_mask/init_density_map are [x,y] (density_map_cuda convention).
                     drv_bin = F.interpolate(
                         drv_pred_du.unsqueeze(0),
-                        size=(data.num_bin_x, data.num_bin_y),
+                        size=(data.num_bin_y, data.num_bin_x),
                         mode='bilinear', align_corners=False,
-                    ).squeeze()  # (num_bin_x, num_bin_y)
+                    ).squeeze().T  # (num_bin_x, num_bin_y)
                     hot_m3 = data.m3_bin_mask & (drv_bin > drv_density_hot_threshold)
                     num_hot = hot_m3.sum().item()
                     if num_hot > 0:
@@ -354,8 +356,9 @@ def global_placement_main(gpdb, rawdb, ps: ParamScheduler, data: PlaceData, args
                         )
                         init_density_map.data.copy_(new_map)
                     avg_m3_eff = data.m3_bin_effective_density[data.m3_bin_mask].mean().item()
+                    density_update_count += 1
                     logger.info(
-                        f"[DensityUpdate] iter={iteration} overflow={overflow:.4f} "
+                        f"[DensityUpdate] #{density_update_count} iter={iteration} overflow={overflow:.4f} "
                         f"hot_m3_bins={num_hot} avg_m3_effective_density={avg_m3_eff:.4f}"
                     )
                     draw_init_density_map(
@@ -363,6 +366,14 @@ def global_placement_main(gpdb, rawdb, ps: ParamScheduler, data: PlaceData, args
                         (f"{iteration}_du", hpwl, data.design_name),
                         args,
                     )
+                    if drv_predictor._has_mpl:
+                        drv_l2_du = drv_pred_du.pow(2).mean().item()
+                        drv_png = os.path.join(
+                            args.result_dir, args.exp_id, args.eval_dir,
+                            f"{data.design_name}_iter{iteration}_du_drv_pred.png",
+                        )
+                        os.makedirs(os.path.dirname(drv_png), exist_ok=True)
+                        drv_predictor.save_drv_png(drv_pred_du, iteration, overflow, drv_l2_du, drv_png)
             # Every 10 iters log M3 effective density average once updates are active
             if density_update_active and iteration % 10 == 0:
                 avg_m3_eff = data.m3_bin_effective_density[data.m3_bin_mask].mean().item()
@@ -653,6 +664,7 @@ def run_placement_main_nesterov(args, logger):
     place_time = time.time() - total_start
     logger.info("GP Time: %.4f LG Time: %.4f DP Time: %.4f Total Place Time: %.4f" % (
         gp_time, lg_time, dp_time, place_time))
+    logger.info("Total Instances: %d Total Nets: %d" % (data.num_nodes, data.num_nets))
     place_metrics = (dp_hpwl, gp_hpwl, top5overflow, overflow, gp_time, dp_time + lg_time, gp_per_iter, place_time)
     if args.timing_opt:
         place_metrics += (wns_early_dp, tns_early_dp, wns_late_dp, tns_late_dp)
