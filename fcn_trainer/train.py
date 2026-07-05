@@ -27,6 +27,7 @@ import argparse
 import os
 import random
 import re
+import time
 
 import numpy as np
 import torch
@@ -434,6 +435,7 @@ def train(args):
 
     # ── training epochs ───────────────────────────────────────────────────────
     print(f"\nTraining for {args.epochs} epochs …")
+    t_start = time.time()
     for epoch in range(1, args.epochs + 1):
         model.train()
         ep_loss = 0.0
@@ -482,7 +484,14 @@ def train(args):
                   f"drv_mae={ep_met['drv_mae']:.5f}  "
                   f"lr={lr_now:.2e}")
 
+    t_total = time.time() - t_start
+    h, m, s = int(t_total // 3600), int(t_total % 3600 // 60), int(t_total % 60)
     print(f"\nBest loss: {best_loss:.5f}")
+    print(f"Total training time: {h:02d}h {m:02d}m {s:02d}s  ({t_total:.1f}s)")
+    with open(os.path.join(args.out_dir, 'training_time.txt'), 'w') as _f:
+        _f.write(f"epochs: {args.epochs}\n")
+        _f.write(f"total_seconds: {t_total:.1f}\n")
+        _f.write(f"total_time: {h:02d}h {m:02d}m {s:02d}s\n")
 
     # ── load best weights before evaluation ──────────────────────────────────
     ckpt = torch.load(os.path.join(args.out_dir, 'best_model.pt'),
@@ -727,7 +736,7 @@ def _parser():
                    help='DRV target normalisation: '
                         'log = scale by log(1+n_drv)/log(1+drv_ref) to encode severity; '
                         'max = legacy, every design peaks at 1.0')
-    p.add_argument('--drv_ref',    type=int,   default=1000,
+    p.add_argument('--drv_ref',    type=int,   default=10000,
                    help='Reference DRV count for log normalisation (default=drv_limit=1000)')
     p.add_argument('--loss_alpha', type=float, default=20.0,
                    help='Weight multiplier for DRV hotspot bins in the loss')

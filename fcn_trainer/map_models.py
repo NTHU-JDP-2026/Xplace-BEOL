@@ -655,7 +655,7 @@ class PlacementMapDataset(Dataset):
         target_key='drv',
         transform=None,
         drv_norm='log',
-        drv_ref=1000,
+        drv_ref=10000,
     ):
         self.files      = sorted(glob.glob(os.path.join(processed_dir, '*.pt')))
         self.input_idx  = [self._KEY_IDX[k] for k in input_keys]
@@ -782,7 +782,7 @@ def _make_parser():
     p.add_argument('--data_dir',   default=None)
     p.add_argument('--sample_dir', default=None)
     p.add_argument('--out_dir',    default=None)
-    p.add_argument('--drv_limit',  type=int,   default=1000)
+    p.add_argument('--drv_limit',  type=int,   default=10000)
     p.add_argument('--save_plots', action='store_true')
     p.add_argument('--plot_dpi',   type=int,   default=200)
     p.add_argument('--grid_size',  type=int,   default=256)
