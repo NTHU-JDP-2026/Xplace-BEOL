@@ -4,6 +4,7 @@ from functools import partial
 import torch.nn.functional as F
 from src.drv_feature_maps import build_drv_feature_maps, load_ap_lookup
 from src.drv_predictor import DRVPredictor
+from src.detail_placement import commit_node_pos_to_gpdb
 
 def get_trunc_node_pos_fn(mov_node_size, data):
     node_pos_lb = mov_node_size / 2 + data.die_ll + 1e-4
@@ -359,13 +360,15 @@ def global_placement_main(gpdb, rawdb, ps: ParamScheduler, data: PlaceData, args
                     density_update_count += 1
                     logger.info(
                         f"[DensityUpdate] #{density_update_count} iter={iteration} overflow={overflow:.4f} "
-                        f"hot_m3_bins={num_hot} avg_m3_effective_density={avg_m3_eff:.4f}"
+                        f"hot_m3_bins={num_hot} avg_m3_effective_density={avg_m3_eff:.4f} "
+                        f"density_weight={ps.density_weight:.4E}"
                     )
-                    draw_init_density_map(
-                        init_density_map, data,
-                        (f"{iteration}_du", hpwl, data.design_name),
-                        args,
-                    )
+                    if args.draw_placement:
+                        draw_init_density_map(
+                            init_density_map, data,
+                            (f"{iteration}_du", hpwl, data.design_name),
+                            args,
+                        )
                     if drv_predictor._has_mpl:
                         drv_l2_du = drv_pred_du.pow(2).mean().item()
                         drv_png = os.path.join(
@@ -475,7 +478,14 @@ def global_placement_main(gpdb, rawdb, ps: ParamScheduler, data: PlaceData, args
             mov_node_pos, data, gpdb, grid_size=args.drv_pred_resolution)
         torch.cuda.synchronize()
 
-        # Reuse Phase 1's final alpha_k as SGD step size
+        # Reuse Phase 1's final alpha_k only as an initial guess — it is a
+        # Barzilai-Borwein step size tuned for Nesterov's momentum update and
+        # its own backtracking loop, not a safe multiplier for a plain SGD
+        # step. Near Phase 1 convergence gradients are nearly flat, so alpha_k
+        # can be enormous; applied blindly here it overshoots and blows up
+        # the placement (overflow saturates near 1.0). Guard it with a simple
+        # backtracking safeguard: if a step increases overflow too much,
+        # undo it and halve the step size.
         phase1_alpha = None
         if optimizer.param_groups[0]['alpha_k']:
             phase1_alpha = optimizer.param_groups[0]['alpha_k'][0].item()
@@ -483,6 +493,10 @@ def global_placement_main(gpdb, rawdb, ps: ParamScheduler, data: PlaceData, args
             phase1_alpha = args.lr
         ft_lr = phase1_alpha
         logger.info(f"[DRV] SGD lr={ft_lr:.4E}  DRV_L2={drv_l2_loss:.4E}")
+
+        overflow_entry = overflow  # overflow at Phase 2 entry (from Phase 1 best solution)
+        max_backtrack = 8
+        overflow_slack = 0.05
 
         for ft_i in range(drv_finetune_iters):
             # Refresh DRV gradient every drv_pred_freq steps
@@ -492,18 +506,47 @@ def global_placement_main(gpdb, rawdb, ps: ParamScheduler, data: PlaceData, args
                     mov_node_pos, data, gpdb, grid_size=args.drv_pred_resolution)
                 torch.cuda.synchronize()
 
-            # SGD step: compute WL + density + DRV gradient, then update
+            # SGD step: compute WL + density + DRV gradient, then update.
+            # Backtrack (halve ft_lr) if the step overshoots and pushes
+            # overflow past its Phase-2-entry value by more than the slack.
+            # overflow_entry is fixed for all of Phase 2, not updated per
+            # step, otherwise the guard only bounds step-to-step overflow
+            # increase and lets overflow ratchet upward without limit.
             _, grad = ft_obj_and_grad_fn(mov_node_pos)
-            with torch.no_grad():
-                mov_node_pos.data -= ft_lr * grad
-            trunc_node_pos_fn(mov_node_pos)
+            prev_pos = mov_node_pos.data.clone()
+            for backtrack_cnt in range(max_backtrack + 1):
+                with torch.no_grad():
+                    mov_node_pos.data = prev_pos - ft_lr * grad
+                trunc_node_pos_fn(mov_node_pos)
+                _, trial_overflow = evaluator_fn(mov_node_pos)
+                if trial_overflow <= overflow_entry + overflow_slack or backtrack_cnt == max_backtrack:
+                    break
+                ft_lr *= 0.5
 
             if ft_i % 10 == 0:
                 hpwl, overflow = evaluator_fn(mov_node_pos)
                 logger.info(
                     f"[DRV finetune] {ft_i}/{drv_finetune_iters} | "
-                    f"hpwl={hpwl:.4E} overflow={overflow:.4f} DRV_L2={drv_l2_loss:.4E}"
+                    f"hpwl={hpwl:.4E} overflow={overflow:.4f} DRV_L2={drv_l2_loss:.4E} "
+                    f"lr={ft_lr:.4E}"
                 )
+
+                if getattr(args, 'exp', False):
+                    # data.design_name may itself contain a path separator
+                    # (e.g. "xplace_work/seed"), so derive the file stem from
+                    # its basename and always ensure the prefix's parent dir
+                    # exists -- gpdb.write_placement() does not create missing
+                    # directories and fails silently otherwise.
+                    dump_dir = os.path.join('exp', 'phase2_def')
+                    os.makedirs(dump_dir, exist_ok=True)
+                    dump_node_pos = torch.cat(
+                        [mov_node_pos[mov_lhs:mov_rhs], data.node_pos[mov_rhs:]], dim=0
+                    )
+                    commit_node_pos_to_gpdb(dump_node_pos, gpdb, data)
+                    design_stem = os.path.basename(data.design_name)
+                    dump_prefix = os.path.join(dump_dir, f"{design_stem}_ft{ft_i:05d}")
+                    gpdb.write_placement(dump_prefix)
+                    logger.info(f"[DRV finetune] Dumped DEF to {dump_prefix}")
                 feat_vis = build_drv_feature_maps(
                     mov_node_pos, data, gpdb,
                     ap_lookup=drv_predictor.ap_lookup,
@@ -567,9 +610,9 @@ def global_placement_main(gpdb, rawdb, ps: ParamScheduler, data: PlaceData, args
     if args.draw_placement:
         draw_fig_with_cairo_cpp(node_pos, data.node_size, data, info, args)
         draw_placement_with_pdn(node_pos, data.node_size, gpdb, data, info, args)
-    draw_bin_density_map(node_pos, data.node_size, data, info, args)
-    if getattr(args, 'use_m3_snet_density', False):
-        draw_init_density_map(init_density_map, data, info, args)
+        draw_bin_density_map(node_pos, data.node_size, data, info, args)
+        if getattr(args, 'use_m3_snet_density', False):
+            draw_init_density_map(init_density_map, data, info, args)
     logger.info("After GP, best solution eval, exact HPWL: %.6E exact Overflow: %.4f" % (hpwl, overflow))
     ps.visualize(args, logger)
     gp_hpwl = hpwl

@@ -31,10 +31,12 @@ docker exec compassionate_pascal bash -c \
   --m3_stripe_density_min 0.25 \
   --design_name ${design_name} \
   --stop_overflow 0.07 \
-  --drv_checkpoint fcn_trainer/results/res128/best_model.pt \
-  --drv_force_weight 0 \
-  --drv_finetune_iters 50 \
-  --drv_phase1_vis_freq 10 \
+  --drv_checkpoint fcn_trainer/results/res256/best_model.pt \
+  --drv_pred_resolution 256 \
+  --drv_force_weight 0.35 \
+  --drv_finetune_iters 100 \
+  --drv_phase1_vis_freq 0 \
+  --exp true \
   --drv_density_update_overflow 0.25 \
   --drv_density_update_step 0.05 \
   --drv_density_update_freq 5  \

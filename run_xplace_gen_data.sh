@@ -26,10 +26,10 @@ docker exec compassionate_pascal bash -c \
 --load_from_raw True \
 --target_density ${target_density} \
 --use_m3_snet_density True \
---m3_density_reduction_factor ${m3_reduction} \
+--m3_stripe_density ${m3_reduction} \
 --output_dir ${design_name} \
 --write_global_placement True \
---use_cell_inflate True \
+--use_cell_inflate ${cell_inflate} \
 --detail_placement False \
 --draw_placement True \
 --design_name ${design_name}" 2>&1

@@ -54,7 +54,7 @@ def get_option():
     parser.add_argument('--route_weight', type=float, default=0, help='the weight of route')
     parser.add_argument('--congest_weight', type=float, default=0, help='the weight of congested force')
     parser.add_argument('--pseudo_weight', type=float, default=0, help='the weight of pseudo net')
-    parser.add_argument('--visualize_cgmap', type=str2bool, default=False, help='visualize congestion map')
+    parser.add_argument('--visualize_cgmap', type=str2bool, default=None, help='visualize congestion map. Default: follows --exp (see bottom of get_option)')
 
     # timing opt params
     parser.add_argument('--timing_opt', type=str2bool, default=False, help='perform timing optimization')
@@ -100,13 +100,20 @@ def get_option():
     parser.add_argument('--drv_grad_ema', type=float, default=0.7,
                         help='EMA decay for DRV gradient (0=replace every step, 1=never update). '
                              '0.5 recommended to smooth oscillation.')
-    parser.add_argument('--drv_phase1_vis_freq', type=int, default=100,
+    parser.add_argument('--drv_phase1_vis_freq', type=int, default=None,
                         help='Run DRV inference for visualisation every N iters during Phase 1 (after drv_pred_overflow). '
-                             '0 = disabled.')
+                             '0 = disabled. Default: follows --exp (see bottom of get_option)')
+    parser.add_argument('--exp', type=str2bool, default=False,
+                        help='Experiment mode. If True: write a DEF snapshot every 10 Phase-2 '
+                             'DRV fine-tuning iterations to ./exp/phase2_def, and also write the '
+                             'run log to ./exp/phase2_log. Also turns on the auxiliary '
+                             'visualization/debug options below (draw_placement, visualize_cgmap, '
+                             'verbose_cpp_log, drv_phase1_vis_freq) unless explicitly overridden on '
+                             'the command line. Default False.')
 
     # logging and saver
     parser.add_argument('--log_freq', type=int, default=100)
-    parser.add_argument('--verbose_cpp_log', type=str2bool, default=False, help='verbose cpp log for debugging')
+    parser.add_argument('--verbose_cpp_log', type=str2bool, default=None, help='verbose cpp log for debugging. Default: follows --exp (see bottom of get_option)')
     parser.add_argument('--cpp_log_level', type=int, default=2, help='0: DEBUG, 1: VERBOSE, 2:INFO')
     parser.add_argument('--result_dir', type=str, default='result', help='log/model root directory')
     parser.add_argument('--exp_id', type=str, default='', help='experiment id')
@@ -115,13 +122,32 @@ def get_option():
     parser.add_argument('--eval_dir', type=str, default='eval', help='visualization directory')
 
     # placement output
-    parser.add_argument('--draw_placement', type=str2bool, default=False, help='draw placement')
+    parser.add_argument('--draw_placement', type=str2bool, default=None, help='draw placement. Default: follows --exp (see bottom of get_option)')
     parser.add_argument('--write_placement', type=str2bool, default=True, help='write placement result')
     parser.add_argument('--write_global_placement', type=str2bool, default=False, help='write global placement result')
     parser.add_argument('--output_dir', type=str, default="output", help='output directory')
     parser.add_argument('--output_prefix', type=str, default="placement", help='prefix of placement output file')
 
     args = parser.parse_args()
+
+    # Auxiliary visualization/debug options default to following --exp, unless
+    # explicitly set on the command line (sentinel default of None above).
+    exp_defaults = {
+        'draw_placement': True,
+        'visualize_cgmap': True,
+        'verbose_cpp_log': True,
+        'drv_phase1_vis_freq': 50,
+    }
+    non_exp_defaults = {
+        'draw_placement': False,
+        'visualize_cgmap': False,
+        'verbose_cpp_log': False,
+        'drv_phase1_vis_freq': 100,
+    }
+    defaults = exp_defaults if args.exp else non_exp_defaults
+    for key, value in defaults.items():
+        if getattr(args, key) is None:
+            setattr(args, key, value)
 
     args.exp_id = datetime.datetime.now().strftime('%Y-%m-%d-%H:%M:%S') + args.exp_id
     args.exp_id = "{}_{}".format(args.exp_id, args.design_name)
