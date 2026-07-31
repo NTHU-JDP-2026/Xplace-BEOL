@@ -34,6 +34,13 @@ import matplotlib
 matplotlib.use('Agg')
 import matplotlib.pyplot as plt
 
+# Single source of truth for DRV-related defaults, shared by map_models.py,
+# train.py and predict.py (previously each file hardcoded its own value and
+# they drifted apart: drv_ref was 10000 in train.py's Dataset but 1000 in
+# predict.py, silently changing the DRV-severity normalisation at inference).
+DEFAULT_DRV_LIMIT = 10000  # process_sample/process_batch: skip samples with n_drv >= this
+DEFAULT_DRV_REF   = 10000  # PlacementMapDataset: reference count for log normalisation
+
 
 # ──────────────────────────────────────────────────────────────────────────────
 # Parsers
@@ -478,7 +485,7 @@ def build_maps(
 def process_sample(
     sample_dir, lef_paths, ap_json_paths, out_dir,
     grid_size=256,
-    drv_limit=1000,
+    drv_limit=DEFAULT_DRV_LIMIT,
     save_plots=False,
     plot_dpi=200,
     verbose=True,
@@ -563,7 +570,7 @@ def process_sample(
 def process_batch(
     data_dir, out_dir, lef_paths, ap_json_paths,
     grid_size=256,
-    drv_limit=1000,
+    drv_limit=DEFAULT_DRV_LIMIT,
     save_plots=False,
     plot_dpi=200,
     verbose=True,
@@ -655,7 +662,7 @@ class PlacementMapDataset(Dataset):
         target_key='drv',
         transform=None,
         drv_norm='log',
-        drv_ref=10000,
+        drv_ref=DEFAULT_DRV_REF,
     ):
         self.files      = sorted(glob.glob(os.path.join(processed_dir, '*.pt')))
         self.input_idx  = [self._KEY_IDX[k] for k in input_keys]
@@ -698,6 +705,30 @@ class PlacementMapDataset(Dataset):
 
     def sample_name(self, idx):
         return os.path.splitext(os.path.basename(self.files[idx]))[0]
+
+
+def add_drv_dataset_args(parser):
+    """Add the CLI args that control PlacementMapDataset construction.
+
+    Shared by train.py and predict.py so their defaults can't drift apart
+    (previously predict.py's --drv_ref default silently disagreed with the
+    value used at training time, corrupting reported metrics).
+    """
+    parser.add_argument('--features', type=str,
+                         default='pin_density,ap,cell_type,aoi,rudy',
+                         help='Comma-separated input feature channels')
+    parser.add_argument('--drv_norm', type=str, default='log',
+                         choices=['log', 'max'],
+                         help='DRV target normalisation: '
+                              'log = scale by log(1+n_drv)/log(1+drv_ref) to encode severity; '
+                              'max = legacy, every design peaks at 1.0')
+    parser.add_argument('--drv_ref', type=int, default=DEFAULT_DRV_REF,
+                         help=f'Reference DRV count for log normalisation (default={DEFAULT_DRV_REF})')
+    parser.add_argument('--tta', dest='tta', action='store_true', default=True,
+                         help='Test-time augmentation: 8x D4 symmetry average (default: on)')
+    parser.add_argument('--no-tta', dest='tta', action='store_false',
+                         help='Disable test-time augmentation')
+    return parser
 
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -782,7 +813,7 @@ def _make_parser():
     p.add_argument('--data_dir',   default=None)
     p.add_argument('--sample_dir', default=None)
     p.add_argument('--out_dir',    default=None)
-    p.add_argument('--drv_limit',  type=int,   default=10000)
+    p.add_argument('--drv_limit',  type=int,   default=DEFAULT_DRV_LIMIT)
     p.add_argument('--save_plots', action='store_true')
     p.add_argument('--plot_dpi',   type=int,   default=200)
     p.add_argument('--grid_size',  type=int,   default=256)

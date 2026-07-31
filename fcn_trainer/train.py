@@ -38,7 +38,7 @@ import matplotlib
 matplotlib.use('Agg')
 import matplotlib.pyplot as plt
 
-from map_models import PlacementMapDataset
+from map_models import PlacementMapDataset, add_drv_dataset_args
 
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -728,16 +728,7 @@ def _parser():
     p.add_argument('--norm',       type=str,   default='instance',
                    choices=['instance', 'batch'],
                    help='Normalization layer: instance (default) or batch')
-    p.add_argument('--features',   type=str,
-                   default='pin_density,ap,cell_type,aoi,rudy',
-                   help='Comma-separated input feature channels')
-    p.add_argument('--drv_norm',   type=str,   default='log',
-                   choices=['log', 'max'],
-                   help='DRV target normalisation: '
-                        'log = scale by log(1+n_drv)/log(1+drv_ref) to encode severity; '
-                        'max = legacy, every design peaks at 1.0')
-    p.add_argument('--drv_ref',    type=int,   default=10000,
-                   help='Reference DRV count for log normalisation (default=drv_limit=1000)')
+    add_drv_dataset_args(p)
     p.add_argument('--loss_alpha', type=float, default=20.0,
                    help='Weight multiplier for DRV hotspot bins in the loss')
     p.add_argument('--log_every',  type=int,   default=10)
@@ -749,10 +740,6 @@ def _parser():
                         '(matched against sample filename). E.g. '
                         '"data_syn2_,data_aes_0" excludes syn2 duplicates and '
                         'dense-DRV aes outliers without touching aes_cipher_top.')
-    p.add_argument('--tta',    dest='tta', action='store_true',  default=True,
-                   help='Test-time augmentation: 8× D4 symmetry average (default: on)')
-    p.add_argument('--no-tta', dest='tta', action='store_false',
-                   help='Disable test-time augmentation')
     return p
 
 
