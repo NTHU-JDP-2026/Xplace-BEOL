@@ -250,7 +250,8 @@ def global_placement_main(gpdb, rawdb, ps: ParamScheduler, data: PlaceData, args
             if ps.use_cell_inflate:
                 output = route_inflation(
                     args, logger, data, rawdb, gpdb, ps, mov_node_pos, mov_node_size, expand_ratio,
-                    constraint_fn=trunc_node_pos_fn, visualize=args.visualize_cgmap
+                    constraint_fn=trunc_node_pos_fn, visualize=args.visualize_cgmap,
+                    drv_predictor=drv_predictor
                 )  # ps.use_cell_inflate is updated in route_inflation
                 if not ps.use_cell_inflate:
                     route_early_terminate_signal = True

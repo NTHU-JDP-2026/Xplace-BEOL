@@ -233,8 +233,11 @@ def _build_rudy_diff(node_pos, data, G, device, lse_beta=30.0):
         _bilinear_scatter(r1_f, c1_f,  demand, S, device)
     )
 
-    # cumsum is natively differentiable in PyTorch
-    rudy = diff.view(S, S)[:G, :G].cumsum(0).cumsum(1)
+    # cumsum is natively differentiable in PyTorch, but has no deterministic
+    # CUDA implementation; the (G, G) map is small enough that doing the
+    # prefix sum on CPU is cheap and keeps results reproducible across runs.
+    mat = diff.view(S, S)[:G, :G]
+    rudy = mat.cpu().cumsum(0).cumsum(1).to(device)
     mx = rudy.max().detach()
     return (rudy / mx.clamp(min=1e-9)) if mx > 0 else rudy
 

@@ -13,6 +13,9 @@ import time
 
 def set_random_seed(args):
     seed = args.seed
+    if getattr(args, "deterministic", True):
+        # must be set before any CUDA context is created (e.g. before torch.cuda.manual_seed_all)
+        os.environ.setdefault("CUBLAS_WORKSPACE_CONFIG", ":4096:8")
     torch.manual_seed(seed)
     torch.cuda.manual_seed_all(seed)
     torch.backends.cudnn.deterministic = True
@@ -20,6 +23,12 @@ def set_random_seed(args):
     np.random.seed(seed)
     random.seed(seed)
     os.environ["PYTHONHASHSEED"] = str(seed)
+    if getattr(args, "deterministic", True):
+        # covers torch-native ops (scatter_add_/index_add_/etc.) used e.g. in DRV feature maps
+        # and timing slack aggregation, which are not affected by the custom CUDA kernels' own
+        # --deterministic switch. warn_only=True so an op without a deterministic kernel just
+        # prints a warning instead of aborting the run.
+        torch.use_deterministic_algorithms(True, warn_only=True)
 
 
 def str2bool(v):

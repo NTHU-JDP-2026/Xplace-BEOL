@@ -48,6 +48,7 @@ def get_option():
     parser.add_argument('--drv_density_hot_threshold', type=float, default=0.1, help='DRV prediction value above which an M3 bin is considered a hotspot')
     parser.add_argument('--use_cell_inflate', type=str2bool, default=False, help='use cell inflation')
     parser.add_argument('--min_area_inc', type=float, default=0.01, help='threshold of terminating inflation')
+    parser.add_argument('--drv_inflate_threshold', type=float, default=0.5, help='DRV prediction value above which a bin is also flagged for cell inflation, in addition to GR congestion-overflow bins')
     parser.add_argument('--use_route_force', type=str2bool, default=False, help='use routing force')
     parser.add_argument('--route_freq', type=int, default=1000, help='routing freq')
     parser.add_argument('--num_route_iter', type=int, default=400, help='number of routing iters')

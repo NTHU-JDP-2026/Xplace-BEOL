@@ -214,7 +214,11 @@ def _build_rudy(node_pos, data, G, device):
     diff.scatter_add_(0, (row1 + 1)  * S +  col0,        -demand)
     diff.scatter_add_(0, (row1 + 1)  * S + (col1 + 1),    demand)
 
-    rudy = diff.view(S, S)[:G, :G].cumsum(0).cumsum(1)
+    # cumsum has no deterministic CUDA implementation; the (G, G) map is small
+    # enough that doing the prefix sum on CPU is cheap and keeps results
+    # reproducible across runs.
+    mat = diff.view(S, S)[:G, :G]
+    rudy = mat.cpu().cumsum(0).cumsum(1).to(device)
     mx   = rudy.max()
     return (rudy / mx) if mx > 0 else rudy
 

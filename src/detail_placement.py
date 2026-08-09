@@ -618,7 +618,7 @@ def write_placement(node_pos, gpdb, id, data: PlaceData, args, logger):
     else:
         commit_node_pos_to_gpdb(node_pos, gpdb, data)
         gpdb.write_placement(prefix)
-    logger.info("Write placement in %s. Time: %.4f" % (prefix, time.time() - start_write_time))
+    logger.info("Write placement in %s.def . Time: %.4f" % (prefix, time.time() - start_write_time))
     return prefix
 
 def external_detail_placement(input_file, data: PlaceData, args, logger, eval_mode=True, dp_engine_name=None):
