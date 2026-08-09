@@ -392,7 +392,8 @@ def train(args):
                                   drv_norm=args.drv_norm, drv_ref=args.drv_ref)
     in_ch   = len(base_ds.input_idx)
 
-    # Hold out all seed + cast samples for testing (never seen during training)
+    # Hold out all seed + cast samples for testing (never seen during training,
+    # and never used to pick checkpoints/hyperparameters — see val split below)
     holdout = [d.strip() for d in args.holdout_designs.split(',')]
     test_indices  = _pick_test_indices(base_ds, holdout_designs=holdout)
 
@@ -400,11 +401,24 @@ def train(args):
     exclude = [d.strip() for d in args.exclude_designs.split(',') if d.strip()]
     excl_set = _pick_exclude_indices(base_ds, exclude_designs=exclude)
 
-    train_indices = [i for i in range(len(base_ds))
-                     if i not in set(test_indices) and i not in excl_set]
+    trainval_indices = [i for i in range(len(base_ds))
+                        if i not in set(test_indices) and i not in excl_set]
+
+    # Carve a validation split out of the non-test pool. This is what
+    # checkpoint selection and hyperparameter tuning should be based on —
+    # the test holdout is only touched once, at the very end, to report an
+    # unbiased final number.
+    rng = random.Random(args.seed)
+    shuffled = trainval_indices[:]
+    rng.shuffle(shuffled)
+    n_val = int(len(shuffled) * args.val_fraction)
+    val_indices   = shuffled[:n_val]
+    train_indices = shuffled[n_val:]
+
     print(f"Holdout designs : {holdout}")
     print(f"Exclude designs : {exclude}  ({len(excl_set)} samples dropped)")
     print(f"Test  samples   : {len(test_indices)}")
+    print(f"Val   samples   : {len(val_indices)}  (val_fraction={args.val_fraction})")
     print(f"Train samples   : {len(train_indices)}")
 
     train_subset = Subset(base_ds, train_indices)
@@ -415,6 +429,11 @@ def train(args):
     print(f"Dataset: {len(train_subset)} train samples  "
           f"(batch_size={args.batch_size}, {len(loader)} batches/epoch)  "
           f"in_ch={in_ch}  resolution={args.resolution}×{args.resolution}")
+
+    val_subset = Subset(base_ds, val_indices)
+    val_ds     = AugmentedDataset(val_subset, augment=False, resolution=args.resolution)
+    val_loader = DataLoader(val_ds, batch_size=args.batch_size,
+                            shuffle=False, num_workers=0, pin_memory=False)
 
     # ── model ─────────────────────────────────────────────────────────────────
     model = UNet(in_ch=in_ch, base_ch=args.base_ch, dropout=args.dropout,
@@ -430,7 +449,8 @@ def train(args):
     # ── history ───────────────────────────────────────────────────────────────
     _MET_KEYS = ('mse', 'rmse', 'mae', 'nrms', 'corr', 'ssim', 'drv_mse', 'drv_mae')
     history = {k: [] for k in ('loss',) + _MET_KEYS}
-    best_loss = float('inf')
+    history.update(val_loss=[], val_corr=[])
+    best_val_loss = float('inf')
     os.makedirs(args.out_dir, exist_ok=True)
 
     # ── training epochs ───────────────────────────────────────────────────────
@@ -466,11 +486,28 @@ def train(args):
         for k in ep_met:
             history[k].append(ep_met[k])
 
-        # Save best model
-        if ep_loss < best_loss:
-            best_loss = ep_loss
+        # ── validation pass (no augmentation, no grad) ──────────────────────
+        model.eval()
+        ep_val_loss = 0.0
+        ep_val_corr = 0.0
+        with torch.no_grad():
+            for x, y in val_loader:
+                x, y = x.to(device), y.to(device)
+                pred = model(x)
+                ep_val_loss += drv_loss(pred, y, alpha=args.loss_alpha).item()
+                ep_val_corr += batch_metrics(pred, y)['corr']
+        n_val_batches = max(len(val_loader), 1)
+        ep_val_loss /= n_val_batches
+        ep_val_corr /= n_val_batches
+        history['val_loss'].append(ep_val_loss)
+        history['val_corr'].append(ep_val_corr)
+
+        # Save best model — selected on VALIDATION loss, never on training
+        # loss (which only decreases) and never on the test holdout.
+        if ep_val_loss < best_val_loss:
+            best_val_loss = ep_val_loss
             torch.save({'epoch': epoch, 'model': model.state_dict(),
-                        'loss': best_loss}, os.path.join(args.out_dir, 'best_model.pt'))
+                        'val_loss': best_val_loss}, os.path.join(args.out_dir, 'best_model.pt'))
 
         # Logging
         if epoch % args.log_every == 0 or epoch == 1:
@@ -482,11 +519,12 @@ def train(args):
                   f"corr={ep_met['corr']:.4f}  ssim={ep_met['ssim']:.4f}  "
                   f"drv_mse={ep_met['drv_mse']:.5f}  "
                   f"drv_mae={ep_met['drv_mae']:.5f}  "
+                  f"val_loss={ep_val_loss:.5f}  val_corr={ep_val_corr:.4f}  "
                   f"lr={lr_now:.2e}")
 
     t_total = time.time() - t_start
     h, m, s = int(t_total // 3600), int(t_total % 3600 // 60), int(t_total % 60)
-    print(f"\nBest loss: {best_loss:.5f}")
+    print(f"\nBest val_loss: {best_val_loss:.5f}")
     print(f"Total training time: {h:02d}h {m:02d}m {s:02d}s  ({t_total:.1f}s)")
     with open(os.path.join(args.out_dir, 'training_time.txt'), 'w') as _f:
         _f.write(f"epochs: {args.epochs}\n")
@@ -513,7 +551,11 @@ def train(args):
     _eval_all(model, base_ds, device, args.out_dir, resolution=args.resolution,
               indices=train_indices, label='train', tta=args.tta)
 
-    # ── metrics: test samples ─────────────────────────────────────────────────
+    # ── metrics: val samples ──────────────────────────────────────────────────
+    _eval_all(model, base_ds, device, args.out_dir, resolution=args.resolution,
+              indices=val_indices, label='val', tta=args.tta)
+
+    # ── metrics: test samples (touch once, at the very end) ────────────────────
     _eval_all(model, base_ds, device, args.out_dir, resolution=args.resolution,
               indices=test_indices, label='test', tta=args.tta)
 
@@ -602,13 +644,14 @@ def _plot_prediction(model, dataset, device, out_dir, sample_idx=0, resolution=2
       Row 0: one panel per input channel
       Row 1: ground truth DRV | predicted DRV | absolute error
     """
-    _INPUT_CFG = [
-        ('Input: Pin Density', 'viridis'),
-        ('Input: AP',          'plasma'),
-        ('Input: Cell-Type',   'RdPu'),
-        ('Input: AOI/OAI',     'YlOrRd'),
-        ('Input: RUDY',        'OrRd'),
-    ]
+    _INPUT_CFG = {
+        'pin_density': ('Input: Pin Density', 'viridis'),
+        'ap':          ('Input: AP',          'plasma'),
+        'cell_type':   ('Input: Cell-Type',   'RdPu'),
+        'aoi':         ('Input: AOI/OAI',     'YlOrRd'),
+        'rudy':        ('Input: RUDY',        'OrRd'),
+        'm3_inv_dist': ('Input: M3 PDN Proximity', 'viridis'),
+    }
 
     model.eval()
     x, y = dataset[sample_idx]
@@ -628,7 +671,10 @@ def _plot_prediction(model, dataset, device, out_dir, sample_idx=0, resolution=2
     fig.patch.set_facecolor(_DARK)
 
     # ── Row 0: inputs ────────────────────────────────────────────────────────
-    for i, (data, (title, cmap)) in enumerate(zip(x_np, _INPUT_CFG)):
+    input_keys = getattr(dataset, 'input_keys', ())
+    for i, data in enumerate(x_np):
+        key = input_keys[i] if i < len(input_keys) else None
+        title, cmap = _INPUT_CFG.get(key, (f'Input: ch{i}', 'viridis'))
         ax = axes[0][i]
         im = ax.imshow(data, origin='lower', cmap=cmap, interpolation='nearest')
         _ax_style(ax, title)
@@ -686,17 +732,27 @@ def _plot_curves(history, out_path):
     fig, axes = plt.subplots(3, 3, figsize=(18, 15))
     fig.patch.set_facecolor(_DARK)
 
+    _VAL_OVERLAY = {'loss': 'val_loss', 'corr': 'val_corr'}
+
     for ax, key, title, color in zip(axes.ravel(), keys, titles, colors):
         vals = history.get(key, [])
         ax.set_facecolor(_DARK2)
-        ax.plot(vals, color=color, linewidth=1.5)
+        ax.plot(vals, color=color, linewidth=1.5, label='train')
+        val_key = _VAL_OVERLAY.get(key)
+        val_vals = history.get(val_key, []) if val_key else []
+        if val_vals:
+            ax.plot(val_vals, color='white', linewidth=1.2, linestyle='--', label='val')
+            ax.legend(fontsize=7, facecolor=_DARK2, labelcolor=_LGRAY)
         ax.set_title(title, color='white', fontsize=11)
         ax.tick_params(colors=_LGRAY, labelsize=8)
         ax.set_xlabel('epoch', color=_GRAY, fontsize=8)
         for sp in ax.spines.values():
             sp.set_color(_BORDER)
         if vals:
-            ax.set_ylabel(f'final = {vals[-1]:.5f}', color=_GRAY, fontsize=8)
+            label = f'final = {vals[-1]:.5f}'
+            if val_vals:
+                label += f'   val = {val_vals[-1]:.5f}'
+            ax.set_ylabel(label, color=_GRAY, fontsize=8)
 
     fig.suptitle('Training Curves', color='white', fontsize=14, y=1.01)
     plt.tight_layout()
@@ -735,6 +791,10 @@ def _parser():
     p.add_argument('--seed',       type=int,   default=42)
     p.add_argument('--holdout_designs', type=str, default='seed,cast',
                    help='Comma-separated design names to hold out as unseen test set')
+    p.add_argument('--val_fraction', type=float, default=0.15,
+                   help='Fraction of the non-test pool to carve out as a validation '
+                        'split, used for checkpoint selection and tuning. The test '
+                        'holdout is never touched until the final report.')
     p.add_argument('--exclude_designs', type=str, default='data_syn2_',
                    help='Comma-separated substring patterns to drop from training '
                         '(matched against sample filename). E.g. '
@@ -764,6 +824,7 @@ if __name__ == '__main__':
     print(f"  base_ch       : {args.base_ch}  dropout={args.dropout}  norm={args.norm}")
     print(f"  loss_alpha    : {args.loss_alpha}")
     print(f"  holdout       : {args.holdout_designs}")
+    print(f"  val_fraction  : {args.val_fraction}")
     print(f"  exclude       : {args.exclude_designs}")
     print(f"  tta           : {args.tta}")
     print("=" * 65 + "\n")

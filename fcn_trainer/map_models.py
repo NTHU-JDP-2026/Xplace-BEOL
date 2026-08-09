@@ -2,13 +2,14 @@
 """
 Feature maps for DRV prediction.
 
-Maps (all 256×256 float32 tensors, stored as channels 0-4):
+Maps (all 256×256 float32 tensors, stored as channels 0-6):
   0  PinDensityMapModel – Gaussian-smeared pin-count density
   1  APMapModel         – Gaussian-smeared pin AP map
   2  CellTypeMapModel   – routing-complexity-weighted cell mixture
   3  AOIDensityMapModel – AOI*/OAI* cell density
   4  RUDYMapModel       – RUDY routing-demand map
-  5  DRVMapModel        – ground-truth DRV density  (target, not input)
+  5  M3StripeMapModel   – PDN proximity (inv-dist to nearest M3 power stripe)
+  6  DRVMapModel        – ground-truth DRV density  (target, not input)
 
 Batch processing
 ----------------
@@ -46,13 +47,25 @@ DEFAULT_DRV_REF   = 10000  # PlacementMapDataset: reference count for log normal
 # Parsers
 # ──────────────────────────────────────────────────────────────────────────────
 
-def count_drv(drc_path):
-    """Fast DRV count: count 'Bounds' lines."""
+_LAYER_TAG_RE = re.compile(r'\(\s*([A-Za-z0-9]+)\s*\)\s*$')
+
+
+def count_drv(drc_path, layer=None):
+    """Fast DRV count: count 'Bounds' lines, optionally restricted to one
+    routing layer (e.g. layer='M2'). The layer tag sits at the end of the
+    rule-description line immediately preceding each 'Bounds' line, e.g.
+    'SHORT: (...) ... ( M2 )'."""
     n = 0
+    current_layer = None
     with open(drc_path) as f:
         for line in f:
             if line.startswith('Bounds'):
-                n += 1
+                if layer is None or current_layer == layer:
+                    n += 1
+            else:
+                m = _LAYER_TAG_RE.search(line)
+                if m:
+                    current_layer = m.group(1)
     return n
 
 
@@ -119,21 +132,58 @@ def load_ap_data(json_paths):
     return ap_map
 
 
-def parse_drc(drc_path, dbu):
-    """Return list of (cx_dbu, cy_dbu) for each DRV bounding-box centre."""
+def parse_drc(drc_path, dbu, layer=None):
+    """Return list of (cx_dbu, cy_dbu) for each DRV bounding-box centre.
+
+    layer: if given (e.g. 'M2'), only violations tagged with that routing
+    layer are returned (see count_drv for where the tag lives).
+    """
     violations = []
     pat = re.compile(
         r'Bounds\s*:\s*\(\s*([\d.]+),\s*([\d.]+)\s*\)\s*\(\s*([\d.]+),\s*([\d.]+)\s*\)')
+    current_layer = None
     with open(drc_path) as f:
         for line in f:
-            bm = pat.search(line)
-            if bm:
-                x1 = float(bm.group(1)) * dbu
-                y1 = float(bm.group(2)) * dbu
-                x2 = float(bm.group(3)) * dbu
-                y2 = float(bm.group(4)) * dbu
-                violations.append(((x1 + x2) / 2.0, (y1 + y2) / 2.0))
+            if line.startswith('Bounds'):
+                if layer is not None and current_layer != layer:
+                    continue
+                bm = pat.search(line)
+                if bm:
+                    x1 = float(bm.group(1)) * dbu
+                    y1 = float(bm.group(2)) * dbu
+                    x2 = float(bm.group(3)) * dbu
+                    y2 = float(bm.group(4)) * dbu
+                    violations.append(((x1 + x2) / 2.0, (y1 + y2) / 2.0))
+            else:
+                m = _LAYER_TAG_RE.search(line)
+                if m:
+                    current_layer = m.group(1)
     return violations
+
+
+_M3_STRIPE_RE = re.compile(
+    r'M3\s+(\d+)\s+\+\s+SHAPE\s+STRIPE\s+\(\s*(\d+)\s+(\d+)\s*\)'
+    r'(?:\s+MASK\s+\d+)?\s+\(\s*\*\s+(\d+)\s*\)'
+)
+
+
+def parse_m3_stripes(def_content):
+    """Return list of (xc_dbu, y0_dbu, y1_dbu, width_dbu) for M3 vertical PDN
+    stripes in the SPECIALNETS section (power/ground straps, not signal nets).
+
+    Only matches full-height stripes of the form
+    'NEW M3 <width> + SHAPE STRIPE ( x y0 ) ( * y1 )' — the many width-0
+    'SHAPE STRIPE ( x y ) <via_name>' entries are M2-M3 via taps at each row
+    and are not routing obstructions in their own right, so they're excluded.
+    """
+    spec = re.search(r'SPECIALNETS \d+ ;(.*?)END SPECIALNETS', def_content, re.DOTALL)
+    if not spec:
+        return []
+    stripes = []
+    for m in _M3_STRIPE_RE.finditer(spec.group(1)):
+        w, xc, y0, y1 = int(m.group(1)), int(m.group(2)), int(m.group(3)), int(m.group(4))
+        stripes.append((xc, y0, y1, w))
+    return stripes
 
 
 def _parse_net_data(def_content, inst_centers):
@@ -356,6 +406,47 @@ class RUDYMapModel(nn.Module):
         return self.rudy_map
 
 
+class M3StripeMapModel(nn.Module):
+    """
+    PDN proximity map: 1 / (1 + distance_to_nearest_M3_stripe_edge_in_bins).
+
+    Varies only along x (stripes run the full die height), so the map is a
+    set of vertical bands, highest right at/inside a stripe footprint and
+    decaying with horizontal distance to the nearest stripe edge.
+
+    Confirmed useful (2026-08-07 correlation study, see fcn_trainer memory):
+    raw M2 DRV violations sit ~7.5x closer to M3 stripe edges than chance,
+    but the effect washes out under the production drv_sigma_bins=10 target
+    blur — the feature is still worth feeding to the model since input/target
+    resolution requirements are independent (the CNN can exploit it even
+    where the marginal linear correlation against the blurred target is weak).
+    """
+
+    def __init__(self, die, stripes, grid_size=256):
+        super().__init__()
+        G = grid_size
+        x0, y0, x1, y1 = die
+        die_w = x1 - x0
+
+        if stripes:
+            centers_bin = np.array([(xc - x0) / die_w * G for xc, *_rest in stripes],
+                                    dtype=np.float32)
+            half_w_bin = np.array([w / 2.0 / die_w * G for *_rest, w in stripes],
+                                   dtype=np.float32)
+            xs = (np.arange(G, dtype=np.float32) + 0.5)
+            dist = np.abs(xs[:, None] - centers_bin[None, :]) - half_w_bin[None, :]
+            dist = np.clip(dist, 0, None).min(axis=1)          # (G,)
+            inv_dist = 1.0 / (1.0 + dist)
+            m = np.broadcast_to(inv_dist[None, :], (G, G)).astype(np.float32)
+        else:
+            m = np.zeros((G, G), dtype=np.float32)
+
+        self.register_buffer('m3_map', torch.from_numpy(m.copy()))
+
+    def forward(self):
+        return self.m3_map
+
+
 class DRVMapModel(nn.Module):
     """
     DRV density map – ground truth target.
@@ -399,14 +490,19 @@ def build_maps(
     cell_smooth_factor=1.5,
     cell_min_sigma_bins=1.0,
     drv_sigma_bins=10.0,
+    drv_layer=None,
     verbose=True,
 ):
     """
-    Parse all input files and build the six map models.
+    Parse all input files and build the seven map models.
+
+    drv_layer: if given (e.g. 'M2'), the DRV ground-truth map only includes
+    violations on that routing layer.
 
     Returns
     -------
-    (pin_density_model, ap_model, cell_type_model, aoi_model, rudy_model, drv_model)
+    (pin_density_model, ap_model, cell_type_model, aoi_model, rudy_model,
+     m3_stripe_model, drv_model)
     """
     def log(msg):
         if verbose:
@@ -420,7 +516,7 @@ def build_maps(
     x0, y0, x1, y1 = die
     die_w, die_h = x1 - x0, y1 - y0
     ap_lookup  = load_ap_data(ap_json_paths)
-    violations = parse_drc(drc_path, dbu)
+    violations = parse_drc(drc_path, dbu, layer=drv_layer)
 
     with open(def_path) as _f:
         _def_content = _f.read()
@@ -473,9 +569,15 @@ def build_maps(
     log(f"  aoi/oai cells: {aoi_t.sum().item()}")
 
     rudy_model = RUDYMapModel(net_data, die, G)
+
+    stripes = parse_m3_stripes(_def_content)
+    m3_stripe_model = M3StripeMapModel(die, stripes, G)
+    log(f"  m3 pdn stripes: {len(stripes)}")
+
     drv_model  = DRVMapModel(violations, die, G, drv_sigma_bins=drv_sigma_bins)
 
-    return (pin_density_model, ap_model, cell_type_model, aoi_model, rudy_model, drv_model)
+    return (pin_density_model, ap_model, cell_type_model, aoi_model, rudy_model,
+            m3_stripe_model, drv_model)
 
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -486,6 +588,7 @@ def process_sample(
     sample_dir, lef_paths, ap_json_paths, out_dir,
     grid_size=256,
     drv_limit=DEFAULT_DRV_LIMIT,
+    drv_layer=None,
     save_plots=False,
     plot_dpi=200,
     verbose=True,
@@ -494,9 +597,12 @@ def process_sample(
     """
     Process one sample directory → save a .pt file.
 
+    drv_layer: if given (e.g. 'M2'), the DRV target/count is restricted to
+    violations on that routing layer.
+
     The .pt file contains:
-      maps     – float32 (6, G, G): [pin_density, ap, cell_type, aoi, rudy, drv]
-      meta     – dict: sample name, drv count, grid size, smoothing config
+      maps     – float32 (7, G, G): [pin_density, ap, cell_type, aoi, rudy, m3_inv_dist, drv]
+      meta     – dict: sample name, drv count, grid size, smoothing config, drv_layer
 
     Returns the output path, or None if skipped.
     """
@@ -507,7 +613,7 @@ def process_sample(
         return None
 
     drc_path = drc_files[0]
-    n_drv    = count_drv(drc_path)
+    n_drv    = count_drv(drc_path, layer=drv_layer)
 
     if n_drv == 0:
         if verbose:
@@ -523,9 +629,9 @@ def process_sample(
         print(f"  proc  {os.path.basename(sample_dir):40s}  drv={n_drv}")
 
     (pin_density_model, ap_model, cell_type_model,
-     aoi_model, rudy_model, drv_model) = build_maps(
+     aoi_model, rudy_model, m3_stripe_model, drv_model) = build_maps(
         def_path, lef_paths, ap_json_paths, drc_path,
-        grid_size=grid_size, verbose=verbose, **smooth_kwargs)
+        grid_size=grid_size, drv_layer=drv_layer, verbose=verbose, **smooth_kwargs)
 
     with torch.no_grad():
         pin_density_map = pin_density_model()
@@ -533,10 +639,12 @@ def process_sample(
         cell_type_map   = cell_type_model()
         aoi_map         = aoi_model()
         rudy_map        = rudy_model()
+        m3_map          = m3_stripe_model()
         drv_map         = drv_model()
 
     maps_tensor = torch.stack(
-        [pin_density_map, ap_map, cell_type_map, aoi_map, rudy_map, drv_map], dim=0)  # (6,G,G)
+        [pin_density_map, ap_map, cell_type_map, aoi_map, rudy_map, m3_map, drv_map],
+        dim=0)  # (7,G,G)
 
     os.makedirs(out_dir, exist_ok=True)
     sample_name = os.path.basename(sample_dir)
@@ -547,17 +655,18 @@ def process_sample(
         'meta': {
             'sample':    sample_name,
             'n_drv':     n_drv,
+            'drv_layer': drv_layer,
             'grid_size': grid_size,
             'smooth':    smooth_kwargs,
-            'map_keys':  ['pin_density', 'ap', 'cell_type', 'aoi', 'rudy', 'drv'],
+            'map_keys':  ['pin_density', 'ap', 'cell_type', 'aoi', 'rudy', 'm3_inv_dist', 'drv'],
         },
     }, out_path)
 
     if save_plots:
         plot_dir = os.path.join(out_dir, 'plots', sample_name)
-        visualize_maps(pin_density_map, ap_map, cell_type_map, aoi_map, rudy_map, drv_map,
+        visualize_maps(pin_density_map, ap_map, cell_type_map, aoi_map, rudy_map, m3_map, drv_map,
                        os.path.join(plot_dir, 'feature_maps.png'))
-        save_individual_maps(pin_density_map, ap_map, cell_type_map, aoi_map, rudy_map, drv_map,
+        save_individual_maps(pin_density_map, ap_map, cell_type_map, aoi_map, rudy_map, m3_map, drv_map,
                              plot_dir, dpi=plot_dpi)
 
     return out_path
@@ -571,6 +680,7 @@ def process_batch(
     data_dir, out_dir, lef_paths, ap_json_paths,
     grid_size=256,
     drv_limit=DEFAULT_DRV_LIMIT,
+    drv_layer=None,
     save_plots=False,
     plot_dpi=200,
     verbose=True,
@@ -580,18 +690,21 @@ def process_batch(
     Process all valid sample subdirectories in data_dir.
     Each accepted sample is saved as {out_dir}/{sample_name}.pt.
     A manifest JSON is written to {out_dir}/manifest.json.
+
+    drv_layer: if given (e.g. 'M2'), restrict the DRV target/count to that
+    routing layer for every sample.
     """
     candidates = sorted([e.path for e in os.scandir(data_dir) if e.is_dir()])
 
     print(f"Batch processing: {len(candidates)} subdirectories in {data_dir}")
-    print(f"  drv_limit={drv_limit}  save_plots={save_plots}  out={out_dir}\n")
+    print(f"  drv_limit={drv_limit}  drv_layer={drv_layer}  save_plots={save_plots}  out={out_dir}\n")
 
     saved, skipped_no_files, skipped_drv = [], 0, 0
 
     for sample_dir in candidates:
         result = process_sample(
             sample_dir, lef_paths, ap_json_paths, out_dir,
-            grid_size=grid_size, drv_limit=drv_limit,
+            grid_size=grid_size, drv_limit=drv_limit, drv_layer=drv_layer,
             save_plots=save_plots, plot_dpi=plot_dpi,
             verbose=verbose, **smooth_kwargs)
 
@@ -610,6 +723,7 @@ def process_batch(
         'out_dir':   out_dir,
         'grid_size': grid_size,
         'drv_limit': drv_limit,
+        'drv_layer': drv_layer,
         'n_saved':   len(saved),
         'n_skipped_no_files': skipped_no_files,
         'n_skipped_drv':      skipped_drv,
@@ -636,24 +750,17 @@ class PlacementMapDataset(Dataset):
     """
     Loads all *.pt files produced by process_batch.
 
-    Each item is a float32 tensor of shape (6, H, W):
-      channel 0 – pin density
-      channel 1 – AP (access points)
-      channel 2 – cell-type mixture
-      channel 3 – AOI/OAI density
-      channel 4 – RUDY routing demand
-      channel 5 – DRV map (ground truth)
+    Channel layout is read from each file's own meta['map_keys'] (written by
+    process_sample), not hardcoded — different processed_dir snapshots can
+    have different channel counts (e.g. older 6-channel dirs without
+    m3_inv_dist alongside newer 7-channel ones), and this dataset only
+    assumes uniformity *within* a single processed_dir.
 
     Args:
         processed_dir : directory containing *.pt files.
-        input_keys    : channels to use as input (default: all 5 feature maps).
+        input_keys    : channels to use as input (default: 5 legacy feature maps).
         target_key    : prediction target channel (default: drv).
     """
-
-    _KEY_IDX = {
-        'pin_density': 0, 'ap': 1, 'cell_type': 2,
-        'aoi': 3, 'rudy': 4, 'drv': 5,
-    }
 
     def __init__(
         self,
@@ -665,8 +772,6 @@ class PlacementMapDataset(Dataset):
         drv_ref=DEFAULT_DRV_REF,
     ):
         self.files      = sorted(glob.glob(os.path.join(processed_dir, '*.pt')))
-        self.input_idx  = [self._KEY_IDX[k] for k in input_keys]
-        self.target_idx = self._KEY_IDX[target_key]
         self.transform  = transform
         self.drv_norm   = drv_norm    # 'log' | 'max'
         self.drv_ref    = drv_ref     # reference count for log normalisation
@@ -674,6 +779,12 @@ class PlacementMapDataset(Dataset):
         if not self.files:
             raise FileNotFoundError(
                 f"No .pt files found in {processed_dir}. Run process_batch() first.")
+
+        map_keys = torch.load(self.files[0], weights_only=True)['meta']['map_keys']
+        key_idx = {k: i for i, k in enumerate(map_keys)}
+        self.input_keys = tuple(input_keys)
+        self.input_idx  = [key_idx[k] for k in input_keys]
+        self.target_idx = key_idx[target_key]
 
     def __len__(self):
         return len(self.files)
@@ -741,6 +852,7 @@ _MAP_CFGS = [
     ('cell_type_map',   'Cell-Type Mixture\n(complexity)',   'RdPu'),
     ('aoi_map',         'AOI/OAI Density\n(aoi*/oai*)',      'YlOrRd'),
     ('rudy_map',        'RUDY\n(routing demand)',            'OrRd'),
+    ('m3_map',          'M3 PDN Proximity\n(inv-dist to stripe)', 'viridis'),
     ('drv_map',         'DRV Map\n(ground truth)',           'hot'),
 ]
 
@@ -749,11 +861,11 @@ def _stat_label(data):
     return f'min={data.min():.4f}  max={data.max():.4f}  mean={data.mean():.5f}'
 
 
-def visualize_maps(density_map, ap_map, cell_type_map, aoi_map, rudy_map, drv_map, out_path):
-    """Save a 1×6 panel PNG at 150 dpi."""
+def visualize_maps(density_map, ap_map, cell_type_map, aoi_map, rudy_map, m3_map, drv_map, out_path):
+    """Save a 1×7 panel PNG at 150 dpi."""
     os.makedirs(os.path.dirname(out_path) or '.', exist_ok=True)
-    tensors = [density_map, ap_map, cell_type_map, aoi_map, rudy_map, drv_map]
-    fig, axes = plt.subplots(1, 6, figsize=(36, 6.5))
+    tensors = [density_map, ap_map, cell_type_map, aoi_map, rudy_map, m3_map, drv_map]
+    fig, axes = plt.subplots(1, 7, figsize=(42, 6.5))
     fig.patch.set_facecolor('#12121e')
 
     for ax, tensor, (_fname, title, cmap) in zip(axes, tensors, _MAP_CFGS):
@@ -776,11 +888,11 @@ def visualize_maps(density_map, ap_map, cell_type_map, aoi_map, rudy_map, drv_ma
     plt.close()
 
 
-def save_individual_maps(density_map, ap_map, cell_type_map, aoi_map, rudy_map, drv_map,
+def save_individual_maps(density_map, ap_map, cell_type_map, aoi_map, rudy_map, m3_map, drv_map,
                          out_dir, dpi=300):
-    """Save six individual high-resolution PNGs into out_dir."""
+    """Save seven individual high-resolution PNGs into out_dir."""
     os.makedirs(out_dir, exist_ok=True)
-    tensors = [density_map, ap_map, cell_type_map, aoi_map, rudy_map, drv_map]
+    tensors = [density_map, ap_map, cell_type_map, aoi_map, rudy_map, m3_map, drv_map]
 
     for tensor, (fname, title, cmap) in zip(tensors, _MAP_CFGS):
         data = tensor.detach().cpu().numpy()
@@ -814,6 +926,9 @@ def _make_parser():
     p.add_argument('--sample_dir', default=None)
     p.add_argument('--out_dir',    default=None)
     p.add_argument('--drv_limit',  type=int,   default=DEFAULT_DRV_LIMIT)
+    p.add_argument('--drv_layer',  type=str,   default=None,
+                   help="Restrict DRV target/count to one routing layer, e.g. 'M2' "
+                        "(default: None = all layers combined)")
     p.add_argument('--save_plots', action='store_true')
     p.add_argument('--plot_dpi',   type=int,   default=200)
     p.add_argument('--grid_size',  type=int,   default=256)
@@ -844,6 +959,7 @@ if __name__ == '__main__':
         out_dir  = args.out_dir  or os.path.join(base, 'processed')
         process_batch(data_dir, out_dir, lef_paths, ap_paths,
                       grid_size=args.grid_size, drv_limit=args.drv_limit,
+                      drv_layer=args.drv_layer,
                       save_plots=args.save_plots, plot_dpi=args.plot_dpi,
                       **smooth)
     else:
@@ -851,6 +967,7 @@ if __name__ == '__main__':
         result  = process_sample(
             args.sample_dir, lef_paths, ap_paths, out_dir,
             grid_size=args.grid_size, drv_limit=args.drv_limit,
+            drv_layer=args.drv_layer,
             save_plots=args.save_plots, plot_dpi=args.plot_dpi,
             **smooth)
         if result:
