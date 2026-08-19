@@ -4,12 +4,15 @@ Build DRV prediction feature maps from XPlace's internal placement state.
 All operations run on the same GPU device as the placer.
 Never reads DEF files — uses PlaceData + GPDatabase directly.
 
-Five output channels (all grid_size × grid_size float32):
+Six output channels (all grid_size × grid_size float32), matching the
+fcn_trainer `dynamic_v19_aes2048_dropaoi` checkpoint's --features order
+(pin_density,ap,cell_type,rudy,net_count,m3_inv_dist):
   0  pin_density  – Gaussian-smeared pin-count density
   1  ap           – AP-weighted Gaussian density  (needs ap_lookup; falls back to pin_density)
   2  cell_type    – routing-complexity-weighted cell mixture
-  3  aoi          – AOI*/OAI* cell density
-  4  rudy         – RUDY routing-demand estimate
+  3  rudy         – RUDY routing-demand estimate
+  4  net_count    – unweighted net-count congestion density
+  5  m3_inv_dist  – PDN proximity: 1 / (1 + distance to nearest M3 power stripe edge, in bins)
 
 Normalisation: each channel divided by its per-sample max, matching
 PlacementMapDataset in fcn_trainer/map_models.py so inference uses the
@@ -25,7 +28,7 @@ import torch
 _FCN_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), '..', 'fcn_trainer')
 if _FCN_DIR not in sys.path:
     sys.path.insert(0, _FCN_DIR)
-from map_models import _separable_gaussian_map, _cell_category, _is_aoi_oai
+from map_models import _separable_gaussian_map, _cell_category
 
 
 def build_drv_feature_maps(
@@ -38,17 +41,24 @@ def build_drv_feature_maps(
     min_sigma_bins=1.0,
 ):
     """
-    Return a (5, grid_size, grid_size) float32 feature tensor on device.
+    Return a (6, grid_size, grid_size) float32 feature tensor on device, channel
+    order [pin_density, ap, cell_type, rudy, net_count, m3_inv_dist].
 
     Args:
         mov_node_pos  : (N_mov, 2) current movable-node positions from the Nesterov
                         optimizer — grabbed inside the GP iteration loop.
         data          : PlaceData object from XPlace.
-        gpdb          : GPDatabase C++ object; provides node_id2celltype_name().
+        gpdb          : GPDatabase C++ object; provides node_id2celltype_name()
+                        and snet_info_tensor() (for the M3 stripe channel).
         ap_lookup     : dict {cell_type_name: float} ap_median values pre-loaded
                         from the fcn_trainer AP JSON files, or None to fall back
                         to pin-count weighting (same as pin_density channel).
-        grid_size     : output resolution — must match the training resolution (128).
+        grid_size     : output resolution — fully independent of XPlace's own
+                        density bins (data.num_bin_x/y); must match the
+                        checkpoint's training resolution family. The dynamic_v*
+                        checkpoints are fully-convolutional and were trained
+                        across multiple bucket resolutions (256/512/1024/2048),
+                        so any multiple of 16 works.
         smooth_factor : Gaussian σ = (cell_size / die_size / 2) × smooth_factor.
         min_sigma_bins: minimum σ expressed in bins (avoids delta-like spikes).
     """
@@ -129,34 +139,28 @@ def build_drv_feature_maps(
     mx = M.max()
     cell_type = (M / mx) if mx > 0 else M
 
-    # ── 4. aoi ─────────────────────────────────────────────────────────────────
-    is_aoi = torch.tensor([_is_aoi_oai(m) for m in macro_names],
-                          dtype=torch.bool, device=device)
-    aoi_mask = valid & is_aoi
-    if aoi_mask.any():
-        w = pin_w[aoi_mask] / (pin_w[aoi_mask].sum() + 1e-9)
-        aoi_raw = _separable_gaussian_map(
-            cx_norm[aoi_mask], cy_norm[aoi_mask], sx[aoi_mask], sy[aoi_mask], w, bins)
-        mx = aoi_raw.max()
-        aoi = (aoi_raw / mx) if mx > 0 else aoi_raw
-    else:
-        aoi = torch.zeros(G, G, device=device)
+    # ── 4. RUDY + net_count (share the same net bounding-box pass) ────────────
+    net_bbox = _net_bboxes(node_pos, data, G)
+    rudy      = _accumulate_bbox_map(net_bbox, G, device, weighted=True)
+    net_count = _accumulate_bbox_map(net_bbox, G, device, weighted=False)
 
-    # ── 5. RUDY ────────────────────────────────────────────────────────────────
-    rudy = _build_rudy(node_pos, data, G, device)
+    # ── 5. m3_inv_dist ─────────────────────────────────────────────────────────
+    m3_inv_dist = _build_m3_stripe_map(data, gpdb, G, device)
 
     # ── Stack + per-channel max-normalise ─────────────────────────────────────
-    feat = torch.stack([pin_density, ap_map, cell_type, aoi, rudy], dim=0)  # (5,G,G)
-    mx = feat.flatten(1).max(dim=1).values.clamp(min=1e-9).view(5, 1, 1)
+    feat = torch.stack(
+        [pin_density, ap_map, cell_type, rudy, net_count, m3_inv_dist], dim=0)  # (6,G,G)
+    mx = feat.flatten(1).max(dim=1).values.clamp(min=1e-9).view(6, 1, 1)
     feat = feat / mx
 
     return feat
 
 
-def _build_rudy(node_pos, data, G, device):
+def _net_bboxes(node_pos, data, G):
     """
-    RUDY routing-demand map via 2-D difference array + cumsum.
-    Complexity: O(N_pins) scatter_reduce + O(G^2) cumsum.
+    Per-net normalised bounding boxes (xn0, xn1, yn0, yn1), masked to valid
+    signal nets. Shared by RUDY and net_count, which only differ in what
+    "demand" value they scatter over each net's bbox.
 
     pin_rel_cpos stores offsets relative to the node centre ('cpos').
     Requires PyTorch >= 1.12 for scatter_reduce_ with reduce='amin'/'amax'.
@@ -192,11 +196,22 @@ def _build_rudy(node_pos, data, G, device):
     net_xn0, net_xn1 = net_xn0[mask], net_xn1[mask]
     net_yn0, net_yn1 = net_yn0[mask], net_yn1[mask]
 
-    # RUDY demand = (W + H) / (W × H)
     min_bin = 1.0 / G
     W = (net_xn1 - net_xn0).clamp(min=min_bin)
     H = (net_yn1 - net_yn0).clamp(min=min_bin)
-    demand = (W + H) / (W * H)
+    return net_xn0, net_xn1, net_yn0, net_yn1, W, H
+
+
+def _accumulate_bbox_map(net_bbox, G, device, weighted):
+    """
+    Accumulate a per-net scalar uniformly over its bbox via 2-D difference
+    array + cumsum. Complexity: O(N_nets) scatter_add + O(G^2) cumsum.
+
+    weighted=True  -> RUDY demand      = (W + H) / (W * H)
+    weighted=False -> net_count demand = 1.0  (unweighted congestion density)
+    """
+    net_xn0, net_xn1, net_yn0, net_yn1, W, H = net_bbox
+    demand = (W + H) / (W * H) if weighted else torch.ones_like(W)
 
     # Integer bin indices
     col0 = (net_xn0 * G).long().clamp(0, G - 1)
@@ -206,7 +221,7 @@ def _build_rudy(node_pos, data, G, device):
 
     # 2-D difference array: add d to rect [row0,row1] × [col0,col1]
     #   diff[r0,c0]+=d  diff[r0,c1+1]-=d  diff[r1+1,c0]-=d  diff[r1+1,c1+1]+=d
-    # Then cumsum(0).cumsum(1) gives the accumulated RUDY map.
+    # Then cumsum(0).cumsum(1) gives the accumulated map.
     S    = G + 1
     diff = torch.zeros(S * S, device=device)
     diff.scatter_add_(0,  row0       * S +  col0,         demand)
@@ -218,9 +233,48 @@ def _build_rudy(node_pos, data, G, device):
     # enough that doing the prefix sum on CPU is cheap and keeps results
     # reproducible across runs.
     mat = diff.view(S, S)[:G, :G]
-    rudy = mat.cpu().cumsum(0).cumsum(1).to(device)
-    mx   = rudy.max()
-    return (rudy / mx) if mx > 0 else rudy
+    out = mat.cpu().cumsum(0).cumsum(1).to(device)
+    mx  = out.max()
+    return (out / mx) if mx > 0 else out
+
+
+def _build_m3_stripe_map(data, gpdb, G, device):
+    """
+    PDN proximity map: 1 / (1 + distance_to_nearest_M3_stripe_edge_in_bins).
+
+    Varies only along x (stripes run the full die height): a set of vertical
+    bands, highest at/inside a stripe footprint and decaying with horizontal
+    distance to the nearest stripe edge. Mirrors M3StripeMapModel in
+    fcn_trainer/map_models.py, but reads stripe geometry directly from the
+    GPDatabase (gpdb.snet_info_tensor()) instead of parsing a DEF file — same
+    source already used by _apply_m3_snet_density_reduction() in initializer.py.
+    """
+    snet_lpos_all, snet_size_all, snet_layer_all = gpdb.snet_info_tensor()
+    snet_lpos_all = snet_lpos_all.to(device)
+    snet_size_all = snet_size_all.to(device)
+    snet_layer_all = snet_layer_all.to(device)
+
+    m3_mask = snet_layer_all == 2  # M3 is layer index 2
+    if m3_mask.sum() == 0:
+        return torch.zeros(G, G, device=device)
+
+    # Same shift/scale as node_pos, so stripe geometry lands in the same
+    # normalised frame as die_ll/die_ur (see initializer.py's identical
+    # transform for the M3 density-blockage pass).
+    m3_lpos = (snet_lpos_all[m3_mask] - data.die_shift) / data.die_scale
+    m3_size = snet_size_all[m3_mask] / data.die_scale
+
+    die_ll = data.die_ll
+    die_w  = data.die_ur[0] - die_ll[0]
+
+    centers_bin = (m3_lpos[:, 0] + m3_size[:, 0] / 2 - die_ll[0]) / die_w * G
+    half_w_bin  = (m3_size[:, 0] / 2) / die_w * G
+
+    xs = torch.arange(G, dtype=torch.float32, device=device) + 0.5   # (G,)
+    dist = (xs.unsqueeze(1) - centers_bin.unsqueeze(0)).abs() - half_w_bin.unsqueeze(0)  # (G, N_stripe)
+    dist = dist.clamp(min=0).min(dim=1).values          # (G,) nearest stripe edge, per column
+    inv_dist = 1.0 / (1.0 + dist)
+    return inv_dist.unsqueeze(0).expand(G, G).contiguous()
 
 
 def load_ap_lookup(json_paths):

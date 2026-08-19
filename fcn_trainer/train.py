@@ -33,7 +33,7 @@ import numpy as np
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from torch.utils.data import DataLoader, Dataset, Subset
+from torch.utils.data import DataLoader, Dataset, Subset, Sampler
 import matplotlib
 matplotlib.use('Agg')
 import matplotlib.pyplot as plt
@@ -97,6 +97,11 @@ class AugmentedDataset(Dataset):
     """
 
     def __init__(self, base_dataset, augment=True, noise_std=0.005, resolution=256):
+        """
+        resolution: target size to resize to, or None to keep each sample's
+        native size untouched (used with --dynamic_bins, where samples are
+        already stored at their own per-design grid_size).
+        """
         self.ds         = base_dataset
         self.augment    = augment
         self.noise_std  = noise_std
@@ -121,8 +126,9 @@ class AugmentedDataset(Dataset):
                 y = torch.rot90(y, k, dims=[-2, -1])
             if self.noise_std > 0:
                 x = (x + torch.randn_like(x) * self.noise_std).clamp(0.0, 1.0)
-        # Downsample after augmentation so flips/rotations stay clean
-        if self.resolution != 256:
+        # Downsample after augmentation so flips/rotations stay clean.
+        # resolution=None (dynamic_bins mode) keeps the sample's native size.
+        if self.resolution is not None and self.resolution != x.shape[-1]:
             x, y = _resize(x, y, self.resolution)
         return x, y
 
@@ -145,6 +151,47 @@ def _resize(x, y, resolution):
     y = F.interpolate(y.unsqueeze(0), size=size, mode='bilinear',
                       align_corners=False).squeeze(0).clamp(0.0, 1.0)
     return x, y
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# Bucket batching (--dynamic_bins)
+# ──────────────────────────────────────────────────────────────────────────────
+
+class BucketBatchSampler(Sampler):
+    """
+    Batches indices so every batch contains samples of the same grid_size.
+    Required with --dynamic_bins: torch.stack (default collate) needs
+    matching shapes, and different designs are stored at different native
+    resolutions. Batches never mix bucket resolutions; bucket order and the
+    samples within each bucket are reshuffled every epoch.
+    """
+
+    def __init__(self, grid_sizes, batch_size, shuffle=True, seed=0):
+        self.batch_size = batch_size
+        self.shuffle = shuffle
+        self.seed = seed
+        self._epoch = 0
+        self.buckets = {}
+        for i, g in enumerate(grid_sizes):
+            self.buckets.setdefault(g, []).append(i)
+
+    def __iter__(self):
+        rng = random.Random(self.seed + self._epoch)
+        self._epoch += 1
+        batches = []
+        for idxs in self.buckets.values():
+            idxs = idxs[:]
+            if self.shuffle:
+                rng.shuffle(idxs)
+            for i in range(0, len(idxs), self.batch_size):
+                batches.append(idxs[i:i + self.batch_size])
+        if self.shuffle:
+            rng.shuffle(batches)
+        return iter(batches)
+
+    def __len__(self):
+        return sum((len(idxs) + self.batch_size - 1) // self.batch_size
+                    for idxs in self.buckets.values())
 
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -345,10 +392,17 @@ def batch_metrics(pred, target, drv_threshold=0.1):
 # Training loop
 # ──────────────────────────────────────────────────────────────────────────────
 
-_DESIGN_RE = re.compile(r'^data_(.+?)(?:_[\d.]+)+(?:_[Tt]rue|_[Ff]alse)?\.pt$')
+_DESIGN_RE = re.compile(r'^data_(.+?)(?:_[\d.]+)+(?:_[Tt]rue|_[Ff]alse)?(?:_\w+)?\.pt$')
 
 def _extract_design(filename):
-    """Extract the design name from a .pt filename (exact, not substring)."""
+    """Extract the design name from a .pt filename (exact, not substring).
+
+    Trailing flow-tag suffixes (e.g. '_dd') after the true/false marker are
+    stripped too — without this, a holdout design's alternate-flow samples
+    (e.g. 'data_aes_0.5_0.7_false_dd.pt') would fail to match the regex,
+    fall back to being treated as their own unique "design", and silently
+    leak into training instead of being held out.
+    """
     m = _DESIGN_RE.match(filename)
     return m.group(1) if m else filename
 
@@ -421,19 +475,36 @@ def train(args):
     print(f"Val   samples   : {len(val_indices)}  (val_fraction={args.val_fraction})")
     print(f"Train samples   : {len(train_indices)}")
 
+    train_resolution = None if args.dynamic_bins else args.resolution
     train_subset = Subset(base_ds, train_indices)
     train_ds = AugmentedDataset(train_subset, augment=True, noise_std=0.005,
-                                resolution=args.resolution)
-    loader   = DataLoader(train_ds, batch_size=args.batch_size,
-                          shuffle=True, num_workers=0, pin_memory=False)
+                                resolution=train_resolution)
+    if args.dynamic_bins:
+        train_grid_sizes = [base_ds.grid_sizes[i] for i in train_indices]
+        train_sampler = BucketBatchSampler(train_grid_sizes, args.batch_size,
+                                           shuffle=True, seed=args.seed)
+        loader = DataLoader(train_ds, batch_sampler=train_sampler,
+                            num_workers=0, pin_memory=False)
+        res_label = f"dynamic ({sorted(set(train_grid_sizes))})"
+    else:
+        loader = DataLoader(train_ds, batch_size=args.batch_size,
+                            shuffle=True, num_workers=0, pin_memory=False)
+        res_label = f"{args.resolution}×{args.resolution}"
     print(f"Dataset: {len(train_subset)} train samples  "
           f"(batch_size={args.batch_size}, {len(loader)} batches/epoch)  "
-          f"in_ch={in_ch}  resolution={args.resolution}×{args.resolution}")
+          f"in_ch={in_ch}  resolution={res_label}")
 
     val_subset = Subset(base_ds, val_indices)
-    val_ds     = AugmentedDataset(val_subset, augment=False, resolution=args.resolution)
-    val_loader = DataLoader(val_ds, batch_size=args.batch_size,
-                            shuffle=False, num_workers=0, pin_memory=False)
+    val_ds     = AugmentedDataset(val_subset, augment=False, resolution=train_resolution)
+    if args.dynamic_bins:
+        val_grid_sizes = [base_ds.grid_sizes[i] for i in val_indices]
+        val_sampler = BucketBatchSampler(val_grid_sizes, args.batch_size,
+                                         shuffle=False, seed=args.seed)
+        val_loader = DataLoader(val_ds, batch_sampler=val_sampler,
+                                num_workers=0, pin_memory=False)
+    else:
+        val_loader = DataLoader(val_ds, batch_size=args.batch_size,
+                                shuffle=False, num_workers=0, pin_memory=False)
 
     # ── model ─────────────────────────────────────────────────────────────────
     model = UNet(in_ch=in_ch, base_ch=args.base_ch, dropout=args.dropout,
@@ -449,8 +520,9 @@ def train(args):
     # ── history ───────────────────────────────────────────────────────────────
     _MET_KEYS = ('mse', 'rmse', 'mae', 'nrms', 'corr', 'ssim', 'drv_mse', 'drv_mae')
     history = {k: [] for k in ('loss',) + _MET_KEYS}
-    history.update(val_loss=[], val_corr=[])
-    best_val_loss = float('inf')
+    history.update(val_loss=[], val_corr=[], val_ssim=[], val_combo=[])
+    best_val_loss  = float('inf')
+    best_val_combo = float('-inf')
     os.makedirs(args.out_dir, exist_ok=True)
 
     # ── training epochs ───────────────────────────────────────────────────────
@@ -490,17 +562,24 @@ def train(args):
         model.eval()
         ep_val_loss = 0.0
         ep_val_corr = 0.0
+        ep_val_ssim = 0.0
         with torch.no_grad():
             for x, y in val_loader:
                 x, y = x.to(device), y.to(device)
                 pred = model(x)
                 ep_val_loss += drv_loss(pred, y, alpha=args.loss_alpha).item()
-                ep_val_corr += batch_metrics(pred, y)['corr']
+                m = batch_metrics(pred, y)
+                ep_val_corr += m['corr']
+                ep_val_ssim += m['ssim']
         n_val_batches = max(len(val_loader), 1)
         ep_val_loss /= n_val_batches
         ep_val_corr /= n_val_batches
+        ep_val_ssim /= n_val_batches
+        ep_val_combo = (ep_val_corr + ep_val_ssim) / 2.0
         history['val_loss'].append(ep_val_loss)
         history['val_corr'].append(ep_val_corr)
+        history['val_ssim'].append(ep_val_ssim)
+        history['val_combo'].append(ep_val_combo)
 
         # Save best model — selected on VALIDATION loss, never on training
         # loss (which only decreases) and never on the test holdout.
@@ -508,6 +587,17 @@ def train(args):
             best_val_loss = ep_val_loss
             torch.save({'epoch': epoch, 'model': model.state_dict(),
                         'val_loss': best_val_loss}, os.path.join(args.out_dir, 'best_model.pt'))
+
+        # Also track a checkpoint selected on (val_corr + val_ssim) / 2 —
+        # val_loss (weighted MSE/MAE) doesn't always pick the epoch that's
+        # best on the metrics we actually report (corr, ssim), especially
+        # once training runs long enough that val and test start to diverge.
+        if ep_val_combo > best_val_combo:
+            best_val_combo = ep_val_combo
+            torch.save({'epoch': epoch, 'model': model.state_dict(),
+                        'val_combo': best_val_combo,
+                        'val_corr': ep_val_corr, 'val_ssim': ep_val_ssim},
+                       os.path.join(args.out_dir, 'best_combo_model.pt'))
 
         # Logging
         if epoch % args.log_every == 0 or epoch == 1:
@@ -520,11 +610,11 @@ def train(args):
                   f"drv_mse={ep_met['drv_mse']:.5f}  "
                   f"drv_mae={ep_met['drv_mae']:.5f}  "
                   f"val_loss={ep_val_loss:.5f}  val_corr={ep_val_corr:.4f}  "
-                  f"lr={lr_now:.2e}")
+                  f"val_ssim={ep_val_ssim:.4f}  lr={lr_now:.2e}")
 
     t_total = time.time() - t_start
     h, m, s = int(t_total // 3600), int(t_total % 3600 // 60), int(t_total % 60)
-    print(f"\nBest val_loss: {best_val_loss:.5f}")
+    print(f"\nBest val_loss: {best_val_loss:.5f}   Best val_combo (corr+ssim)/2: {best_val_combo:.5f}")
     print(f"Total training time: {h:02d}h {m:02d}m {s:02d}s  ({t_total:.1f}s)")
     with open(os.path.join(args.out_dir, 'training_time.txt'), 'w') as _f:
         _f.write(f"epochs: {args.epochs}\n")
@@ -532,9 +622,14 @@ def train(args):
         _f.write(f"total_time: {h:02d}h {m:02d}m {s:02d}s\n")
 
     # ── load best weights before evaluation ──────────────────────────────────
-    ckpt = torch.load(os.path.join(args.out_dir, 'best_model.pt'),
+    # select_by='loss' (default) keeps existing behaviour; 'combo' picks the
+    # checkpoint with the best (val_corr+val_ssim)/2 instead, which can pick
+    # a different (often later) epoch than the val_loss minimum.
+    ckpt_name = 'best_combo_model.pt' if args.select_by == 'combo' else 'best_model.pt'
+    ckpt = torch.load(os.path.join(args.out_dir, ckpt_name),
                       map_location=device, weights_only=True)
     model.load_state_dict(ckpt['model'])
+    print(f"Evaluating checkpoint: {ckpt_name}  (epoch {ckpt['epoch']})")
 
     # ── save training curves ──────────────────────────────────────────────────
     _plot_curves(history, os.path.join(args.out_dir, 'training_curves.png'))
@@ -544,19 +639,19 @@ def train(args):
         name = base_ds.sample_name(test_idx)
         safe = name.replace('/', '_').replace(' ', '_')
         _plot_prediction(model, base_ds, device, args.out_dir,
-                         sample_idx=test_idx, resolution=args.resolution,
+                         sample_idx=test_idx, resolution=train_resolution,
                          filename=f'prediction_test_{safe}.png', tta=args.tta)
 
     # ── metrics: train samples ────────────────────────────────────────────────
-    _eval_all(model, base_ds, device, args.out_dir, resolution=args.resolution,
+    _eval_all(model, base_ds, device, args.out_dir, resolution=train_resolution,
               indices=train_indices, label='train', tta=args.tta)
 
     # ── metrics: val samples ──────────────────────────────────────────────────
-    _eval_all(model, base_ds, device, args.out_dir, resolution=args.resolution,
+    _eval_all(model, base_ds, device, args.out_dir, resolution=train_resolution,
               indices=val_indices, label='val', tta=args.tta)
 
     # ── metrics: test samples (touch once, at the very end) ────────────────────
-    _eval_all(model, base_ds, device, args.out_dir, resolution=args.resolution,
+    _eval_all(model, base_ds, device, args.out_dir, resolution=train_resolution,
               indices=test_indices, label='test', tta=args.tta)
 
     return model, history
@@ -581,7 +676,7 @@ def _eval_all(model, dataset, device, out_dir, resolution=256, indices=None,
     rows = []
     for idx in indices:
         x, y = dataset[idx]
-        if resolution != 256:
+        if resolution is not None and resolution != x.shape[-1]:
             x, y = _resize(x, y, resolution)
         x = x.to(device)
         pred = tta_predict(model, x) if tta else model(x.unsqueeze(0)).squeeze(0)
@@ -650,12 +745,13 @@ def _plot_prediction(model, dataset, device, out_dir, sample_idx=0, resolution=2
         'cell_type':   ('Input: Cell-Type',   'RdPu'),
         'aoi':         ('Input: AOI/OAI',     'YlOrRd'),
         'rudy':        ('Input: RUDY',        'OrRd'),
+        'net_count':   ('Input: Net Count',   'PuBu'),
         'm3_inv_dist': ('Input: M3 PDN Proximity', 'viridis'),
     }
 
     model.eval()
     x, y = dataset[sample_idx]
-    if resolution != 256:
+    if resolution is not None and resolution != x.shape[-1]:
         x, y = _resize(x, y, resolution)
     x = x.to(device)
     pred = tta_predict(model, x) if tta else model(x.unsqueeze(0)).squeeze(0)
@@ -732,7 +828,7 @@ def _plot_curves(history, out_path):
     fig, axes = plt.subplots(3, 3, figsize=(18, 15))
     fig.patch.set_facecolor(_DARK)
 
-    _VAL_OVERLAY = {'loss': 'val_loss', 'corr': 'val_corr'}
+    _VAL_OVERLAY = {'loss': 'val_loss', 'corr': 'val_corr', 'ssim': 'val_ssim'}
 
     for ax, key, title, color in zip(axes.ravel(), keys, titles, colors):
         vals = history.get(key, [])
@@ -773,7 +869,13 @@ def _parser():
     p.add_argument('--out_dir',       default=None,
                    help='Output directory (default: results/res<N>)')
     p.add_argument('--resolution', type=int, default=128, choices=[32, 64, 128, 256],
-                   help='Training resolution. 256×256 .pt maps are downsampled on-the-fly.')
+                   help='Training resolution. 256×256 .pt maps are downsampled on-the-fly. '
+                        'Ignored when --dynamic_bins is set.')
+    p.add_argument('--dynamic_bins', action='store_true',
+                   help='Train at each sample\'s native per-design grid_size '
+                        '(produced by map_models.py --dynamic_bins) instead '
+                        'of resizing everything to --resolution. Batches are '
+                        'formed within same-size buckets only.')
     p.add_argument('--epochs',     type=int,   default=600)
     p.add_argument('--batch_size', type=int,   default=16)
     p.add_argument('--lr',         type=float, default=1e-3)
@@ -789,6 +891,10 @@ def _parser():
                    help='Weight multiplier for DRV hotspot bins in the loss')
     p.add_argument('--log_every',  type=int,   default=10)
     p.add_argument('--seed',       type=int,   default=42)
+    p.add_argument('--select_by', type=str, default='loss', choices=['loss', 'combo'],
+                   help="Checkpoint selection criterion for final evaluation: "
+                        "'loss' (default) = lowest val_loss (best_model.pt); "
+                        "'combo' = highest (val_corr+val_ssim)/2 (best_combo_model.pt)")
     p.add_argument('--holdout_designs', type=str, default='seed,cast',
                    help='Comma-separated design names to hold out as unseen test set')
     p.add_argument('--val_fraction', type=float, default=0.15,
@@ -808,14 +914,18 @@ if __name__ == '__main__':
 
     base = os.path.dirname(os.path.abspath(__file__))
     if args.out_dir is None:
-        args.out_dir = os.path.join(base, 'results', f'res{args.resolution}')
+        res_tag = 'dynamic' if args.dynamic_bins else f'res{args.resolution}'
+        args.out_dir = os.path.join(base, 'results', res_tag)
 
     print("=" * 65)
     print("  DRV Map Predictor  –  U-Net Training")
     print("=" * 65)
     print(f"  processed_dir : {args.processed_dir}")
     print(f"  out_dir       : {args.out_dir}")
-    print(f"  resolution    : {args.resolution}×{args.resolution}")
+    if args.dynamic_bins:
+        print(f"  resolution    : dynamic (native per-sample grid_size, --resolution ignored)")
+    else:
+        print(f"  resolution    : {args.resolution}×{args.resolution}")
     print(f"  epochs        : {args.epochs}")
     print(f"  batch_size    : {args.batch_size}")
     print(f"  lr            : {args.lr}  weight_decay={args.weight_decay}")

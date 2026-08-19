@@ -3,7 +3,7 @@ from src import *
 from functools import partial
 import torch.nn.functional as F
 from src.drv_feature_maps import build_drv_feature_maps, load_ap_lookup
-from src.drv_predictor import DRVPredictor
+from src.drv_predictor import DRVPredictor, resolve_drv_grid_size
 from src.detail_placement import commit_node_pos_to_gpdb
 
 def get_trunc_node_pos_fn(mov_node_size, data):
@@ -117,6 +117,13 @@ def global_placement_main(gpdb, rawdb, ps: ParamScheduler, data: PlaceData, args
         and getattr(data, 'm3_bin_mask', None) is not None
         and getattr(args, 'm3_stripe_density', args.target_density) > m3_stripe_density_min
     )
+    # Hysteresis band: activate once overflow drops below drv_density_update_overflow,
+    # but pause (not permanently latch) if overflow springs back up past 2x that
+    # threshold — e.g. after a density-map edit destabilizes the Nesterov step and
+    # overflow rebounds toward ~1.0. Without this, updates kept firing every
+    # drv_density_update_freq iters regardless of overflow, repeatedly perturbing
+    # init_density_map mid-collapse and preventing density_weight from recovering.
+    drv_density_update_pause_overflow = drv_density_update_overflow * 2.0
     density_update_active = False
     density_update_count = 0
 
@@ -251,7 +258,6 @@ def global_placement_main(gpdb, rawdb, ps: ParamScheduler, data: PlaceData, args
                 output = route_inflation(
                     args, logger, data, rawdb, gpdb, ps, mov_node_pos, mov_node_size, expand_ratio,
                     constraint_fn=trunc_node_pos_fn, visualize=args.visualize_cgmap,
-                    drv_predictor=drv_predictor
                 )  # ps.use_cell_inflate is updated in route_inflation
                 if not ps.use_cell_inflate:
                     route_early_terminate_signal = True
@@ -315,7 +321,7 @@ def global_placement_main(gpdb, rawdb, ps: ParamScheduler, data: PlaceData, args
             feat = build_drv_feature_maps(
                 mov_node_pos, data, gpdb,
                 ap_lookup=drv_predictor.ap_lookup,
-                grid_size=args.drv_pred_resolution,
+                grid_size=drv_predictor.grid_size,
             )
             drv_pred_vis = drv_predictor.predict(feat)
             drv_l2_vis = drv_pred_vis.pow(5).mean().item()
@@ -329,12 +335,19 @@ def global_placement_main(gpdb, rawdb, ps: ParamScheduler, data: PlaceData, args
                     f"[DensityUpdate] Activated at iter={iteration} overflow={overflow:.4f} "
                     f"m3_density={getattr(args,'m3_stripe_density',0.7):.2f} -> min={m3_stripe_density_min:.2f}"
                 )
+            elif density_update_active and overflow > drv_density_update_pause_overflow:
+                density_update_active = False
+                logger.info(
+                    f"[DensityUpdate] Paused at iter={iteration} overflow={overflow:.4f} "
+                    f"(> {drv_density_update_pause_overflow:.2f}) — placement destabilized, "
+                    f"waiting for overflow < {drv_density_update_overflow:.2f} to resume"
+                )
             if density_update_active and iteration % drv_density_update_freq == 0:
                 with torch.no_grad():
                     feat_du = build_drv_feature_maps(
                         mov_node_pos, data, gpdb,
                         ap_lookup=drv_predictor.ap_lookup,
-                        grid_size=args.drv_pred_resolution,
+                        grid_size=drv_predictor.grid_size,
                     )
                     drv_pred_du = drv_predictor.predict(feat_du)  # (1, y, x)
                     # Resize to bin-grid and transpose: DRV pred is [y,x] but
@@ -476,7 +489,7 @@ def global_placement_main(gpdb, rawdb, ps: ParamScheduler, data: PlaceData, args
         # Compute initial DRV gradient and cache in ps.drv_grad for calc_obj_and_grad
         torch.cuda.empty_cache()
         ps.drv_grad, drv_l2_loss = drv_predictor.compute_force(
-            mov_node_pos, data, gpdb, grid_size=args.drv_pred_resolution)
+            mov_node_pos, data, gpdb, grid_size=drv_predictor.grid_size)
         torch.cuda.synchronize()
 
         # Reuse Phase 1's final alpha_k only as an initial guess — it is a
@@ -504,7 +517,7 @@ def global_placement_main(gpdb, rawdb, ps: ParamScheduler, data: PlaceData, args
             if ft_i % args.drv_pred_freq == 0:
                 torch.cuda.empty_cache()
                 ps.drv_grad, drv_l2_loss = drv_predictor.compute_force(
-                    mov_node_pos, data, gpdb, grid_size=args.drv_pred_resolution)
+                    mov_node_pos, data, gpdb, grid_size=drv_predictor.grid_size)
                 torch.cuda.synchronize()
 
             # SGD step: compute WL + density + DRV gradient, then update.
@@ -551,7 +564,7 @@ def global_placement_main(gpdb, rawdb, ps: ParamScheduler, data: PlaceData, args
                 feat_vis = build_drv_feature_maps(
                     mov_node_pos, data, gpdb,
                     ap_lookup=drv_predictor.ap_lookup,
-                    grid_size=args.drv_pred_resolution,
+                    grid_size=drv_predictor.grid_size,
                 )
                 drv_pred_vis = drv_predictor.step(feat_vis, ft_i, overflow)
                 if drv_predictor._has_mpl:
@@ -666,9 +679,24 @@ def run_placement_main_nesterov(args, logger):
         os.makedirs(drv_predictor.phase2_out_dir, exist_ok=True)
         ap_paths = [p.strip() for p in args.drv_ap_json.split(',') if p.strip()]
         drv_predictor.ap_lookup = load_ap_lookup(ap_paths)
+
+        # Resolve the DRV feature-map resolution once (die size is fixed for
+        # the whole run). Adaptive mode picks grid_size from the physical die
+        # size the same way fcn_trainer's --dynamic_bins training data was
+        # bucketed; either way the prediction gets bilinear-resized back onto
+        # the num_bin_x/num_bin_y placement grid downstream, so this never
+        # touches XPlace's own density bins.
+        if getattr(args, 'drv_pred_adaptive', False):
+            candidates = tuple(int(c) for c in args.drv_grid_candidates.split(','))
+            drv_predictor.grid_size = resolve_drv_grid_size(
+                data, gpdb, args.drv_target_um_per_bin, candidates)
+        else:
+            drv_predictor.grid_size = args.drv_pred_resolution
+
         logger.info(
             f"DRVPredictor enabled | start_overflow={args.drv_pred_overflow} "
-            f"freq={args.drv_pred_freq} resolution={args.drv_pred_resolution} "
+            f"freq={args.drv_pred_freq} resolution={drv_predictor.grid_size} "
+            f"({'adaptive, target=' + str(args.drv_target_um_per_bin) + 'um/bin' if getattr(args, 'drv_pred_adaptive', False) else 'fixed'}) "
             f"ap_channels={'yes' if drv_predictor.ap_lookup else 'no (pin-count fallback)'}")
     elif getattr(args, 'drv_checkpoint', ''):
         logger.warning(f"DRV checkpoint not found: {args.drv_checkpoint} — prediction disabled")

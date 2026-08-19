@@ -19,11 +19,28 @@ _FCN_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), '..', 'fcn_t
 if _FCN_DIR not in sys.path:
     sys.path.insert(0, _FCN_DIR)
 from train import UNet
+from map_models import pick_grid_size
+
+
+def resolve_drv_grid_size(data, gpdb, target_um_per_bin, candidates=(256, 512, 1024, 2048)):
+    """
+    Pick a DRV feature-map grid_size from this design's physical die size,
+    mirroring fcn_trainer's process_batch_dynamic() training-data bucketing
+    (same pick_grid_size() call, same candidates). Die size is read from the
+    *original* (pre shift/scale) die extents and the DEF's DBU-per-micron
+    factor, so it matches what map_models.py's DEF-only _die_size_um() would
+    compute for the same design.
+    """
+    dbu_per_micron = gpdb.microns()
+    die_w_um = (data.ori_die_hx - data.ori_die_lx) / dbu_per_micron
+    die_h_um = (data.ori_die_hy - data.ori_die_ly) / dbu_per_micron
+    return pick_grid_size(die_w_um, die_h_um, target_um_per_bin, candidates)
 
 
 class DRVPredictor:
     """
-    Loads a trained U-Net checkpoint and runs inference on (5, H, W) feature maps.
+    Loads a trained U-Net checkpoint and runs inference on (C, H, W) feature maps
+    (C is inferred from the checkpoint itself — see build_drv_feature_maps()).
 
     Predictions are saved as:
       {out_dir}/drv_iter{N:05d}_ovfl{overflow:.3f}.pt   – (1, H, W) raw tensor
@@ -73,7 +90,7 @@ class DRVPredictor:
     def predict(self, feature_maps):
         """
         Args:
-            feature_maps : (5, H, W) float32 tensor on device
+            feature_maps : (C, H, W) float32 tensor on device (C must match checkpoint)
         Returns:
             (1, H, W) float32 DRV density prediction on device
         """
@@ -126,7 +143,7 @@ class DRVPredictor:
         Run inference on feature_maps, save .pt tensor and (optionally) .png.
 
         Args:
-            feature_maps : (5, H, W) tensor produced by build_drv_feature_maps()
+            feature_maps : (C, H, W) tensor produced by build_drv_feature_maps()
             iteration    : current GP iteration number (for filename)
             overflow     : current placement overflow (for filename / title)
         """
@@ -152,17 +169,19 @@ class DRVPredictor:
     def _save_png(self, feature_maps, drv_pred, iteration, overflow, l2_loss, path):
         import matplotlib.pyplot as plt
 
-        feat_np = feature_maps.cpu().numpy()   # (5, H, W)
+        feat_np = feature_maps.cpu().numpy()   # (C, H, W)
         pred_np = drv_pred.cpu().numpy()[0]    # (H, W)
 
+        # Matches the channel order produced by build_drv_feature_maps().
         ch_cfgs = [
             ('Pin Density', 'viridis'),
             ('AP',          'plasma'),
             ('Cell-Type',   'RdPu'),
-            ('AOI/OAI',     'YlOrRd'),
             ('RUDY',        'OrRd'),
-        ]
-        ncols = len(ch_cfgs) + 1   # 5 inputs + 1 prediction
+            ('Net Count',   'YlGnBu'),
+            ('M3 Stripe',   'YlOrRd'),
+        ][:feat_np.shape[0]]
+        ncols = len(ch_cfgs) + 1   # N inputs + 1 prediction
         fig, axes = plt.subplots(1, ncols, figsize=(5 * ncols, 5))
         fig.patch.set_facecolor('#12121e')
 

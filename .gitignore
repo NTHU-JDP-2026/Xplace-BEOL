@@ -13,6 +13,7 @@ build/
 *.def
 *.lef
 *.guide
+*.rpt
 xplace_work
 result/
 data/cad

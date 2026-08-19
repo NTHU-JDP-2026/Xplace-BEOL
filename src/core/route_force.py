@@ -481,7 +481,7 @@ def filler_pseudo_wire_force(data, ps, mov_node_pos, mov_node_size, routeforce, 
 def route_inflation(
     args, logger, data, rawdb, gpdb, ps, mov_node_pos, mov_node_size, expand_ratio,
     constraint_fn=None, skip_m1_route=True, use_weighted_inflation=True, hv_same_ratio=True,
-    dynamic_target_density=True, drv_predictor=None, **kwargs
+    dynamic_target_density=True, **kwargs
 ):
     mov_lhs, mov_rhs = data.movable_index
     fix_lhs, fix_rhs = data.fixed_connected_index
@@ -543,38 +543,6 @@ def route_inflation(
     )
     grdb, routeforce, input_mat, cg_mapHV, _, _, route_gradmat, gr_metrics = output
     numOvflNets, gr_wirelength, gr_numVias, gr_numShorts, rc_hor_mean, rc_ver_mean = gr_metrics
-
-    # 2b) also flag DRV-hotspot bins (FCN prediction) for inflation, on top of
-    # GR congestion-overflow bins. A bin whose predicted DRV exceeds
-    # drv_inflate_threshold is treated as if it were congested, so cells sitting
-    # there get inflated the same way congested-bin cells do.
-    drv_inflate_threshold = getattr(args, 'drv_inflate_threshold', 0.5)
-    if drv_predictor is not None and drv_inflate_threshold is not None:
-        with torch.no_grad():
-            from ..drv_feature_maps import build_drv_feature_maps
-            feat_infl = build_drv_feature_maps(
-                mov_node_pos, data, gpdb,
-                ap_lookup=drv_predictor.ap_lookup,
-                grid_size=args.drv_pred_resolution,
-            )
-            drv_pred_infl = drv_predictor.predict(feat_infl)  # (1, y, x)
-            # Resize to the GR grid and transpose: DRV pred is [y,x] but
-            # input_mat is [x,y] (density_map_cuda convention, same as elsewhere).
-            drv_infl_resized = torch.nn.functional.interpolate(
-                drv_pred_infl.unsqueeze(0),
-                size=(input_mat.shape[1], input_mat.shape[0]),
-                mode='bilinear', align_corners=False,
-            ).squeeze().T  # (input_mat.shape[0], input_mat.shape[1])
-            drv_hot_mask = (drv_infl_resized > drv_inflate_threshold).float()
-        num_drv_hot = drv_hot_mask.sum().item()
-        if num_drv_hot > 0:
-            logger.info(
-                "[CellInflate] DRV-hotspot bins (pred>%.2f): %d / %d also flagged for inflation" % (
-                    drv_inflate_threshold, num_drv_hot, drv_hot_mask.numel()
-                )
-            )
-        input_mat = torch.maximum(input_mat, drv_hot_mask)
-        cg_mapHV = torch.maximum(cg_mapHV, drv_hot_mask.unsqueeze(0))
 
     num_bin_x, num_bin_y = input_mat.shape[0], input_mat.shape[1]
     unit_len_x, unit_len_y = routeforce.gcell_steps()

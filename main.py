@@ -48,7 +48,6 @@ def get_option():
     parser.add_argument('--drv_density_hot_threshold', type=float, default=0.1, help='DRV prediction value above which an M3 bin is considered a hotspot')
     parser.add_argument('--use_cell_inflate', type=str2bool, default=False, help='use cell inflation')
     parser.add_argument('--min_area_inc', type=float, default=0.01, help='threshold of terminating inflation')
-    parser.add_argument('--drv_inflate_threshold', type=float, default=0.5, help='DRV prediction value above which a bin is also flagged for cell inflation, in addition to GR congestion-overflow bins')
     parser.add_argument('--use_route_force', type=str2bool, default=False, help='use routing force')
     parser.add_argument('--route_freq', type=int, default=1000, help='routing freq')
     parser.add_argument('--num_route_iter', type=int, default=400, help='number of routing iters')
@@ -85,7 +84,21 @@ def get_option():
     parser.add_argument('--drv_pred_freq', type=int, default=10,
                         help='Run DRV prediction every N GP iterations (after threshold).')
     parser.add_argument('--drv_pred_resolution', type=int, default=128,
-                        help='Feature-map resolution for DRV prediction (must match training).')
+                        help='Feature-map resolution for DRV prediction (must match training). '
+                             'Ignored when --drv_pred_adaptive is set.')
+    parser.add_argument('--drv_pred_adaptive', type=str2bool, default=False,
+                        help='Resolve DRV feature-map grid_size from this design\'s physical die '
+                             'size instead of the fixed --drv_pred_resolution, mirroring '
+                             'fcn_trainer\'s --dynamic_bins training-data bucketing (pick_grid_size). '
+                             'The prediction is bilinear-interpolated back onto the '
+                             'num_bin_x/num_bin_y placement grid either way, so this only changes '
+                             'the resolution the U-Net itself sees, not the placement bin grid.')
+    parser.add_argument('--drv_target_um_per_bin', type=float, default=0.95,
+                        help='Target physical bin size (µm) for --drv_pred_adaptive. Must match '
+                             'the checkpoint\'s training-time --target_um_per_bin to stay in-distribution '
+                             '(0.95 for the dynamic_v* checkpoints).')
+    parser.add_argument('--drv_grid_candidates', type=str, default='256,512,1024,2048',
+                        help='Comma-separated grid_size candidates for --drv_pred_adaptive.')
     parser.add_argument('--drv_ap_json', type=str, default='',
                         help='Comma-separated AP JSON paths for the ap channel. '
                              'Empty = fall back to pin-density weighting.')

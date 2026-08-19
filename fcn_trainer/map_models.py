@@ -2,14 +2,15 @@
 """
 Feature maps for DRV prediction.
 
-Maps (all 256×256 float32 tensors, stored as channels 0-6):
+Maps (G×G float32 tensors, G = per-sample grid_size, stored as channels 0-7):
   0  PinDensityMapModel – Gaussian-smeared pin-count density
   1  APMapModel         – Gaussian-smeared pin AP map
   2  CellTypeMapModel   – routing-complexity-weighted cell mixture
   3  AOIDensityMapModel – AOI*/OAI* cell density
-  4  RUDYMapModel       – RUDY routing-demand map
-  5  M3StripeMapModel   – PDN proximity (inv-dist to nearest M3 power stripe)
-  6  DRVMapModel        – ground-truth DRV density  (target, not input)
+  4  RUDYMapModel       – RUDY routing-demand map (size-weighted)
+  5  NetCountMapModel   – unweighted net-count congestion density
+  6  M3StripeMapModel   – PDN proximity (inv-dist to nearest M3 power stripe)
+  7  DRVMapModel        – ground-truth DRV density  (target, not input)
 
 Batch processing
 ----------------
@@ -48,25 +49,66 @@ DEFAULT_DRV_REF   = 10000  # PlacementMapDataset: reference count for log normal
 # ──────────────────────────────────────────────────────────────────────────────
 
 _LAYER_TAG_RE = re.compile(r'\(\s*([A-Za-z0-9]+)\s*\)\s*$')
+_RULE_TYPE_RE = re.compile(r'^\S+:\s*\(\s*([^)]+?)\s*\)')
 
 
-def count_drv(drc_path, layer=None):
+def count_drv(drc_path, layer=None, rule_types=None):
     """Fast DRV count: count 'Bounds' lines, optionally restricted to one
-    routing layer (e.g. layer='M2'). The layer tag sits at the end of the
-    rule-description line immediately preceding each 'Bounds' line, e.g.
-    'SHORT: (...) ... ( M2 )'."""
+    routing layer (e.g. layer='M2') and/or a set of rule types (e.g.
+    rule_types={'Metal Short', 'EndOfLine Keepout', 'EndOfLine Spacing'}).
+    The layer tag sits at the end of the rule-description line immediately
+    preceding each 'Bounds' line, e.g. 'SHORT: ( Metal Short ) ... ( M2 )' —
+    the rule type is the parenthesized text right after the category prefix,
+    the layer is the trailing parenthesized tag."""
     n = 0
     current_layer = None
+    current_rule_type = None
+    allowed_types = set(rule_types) if rule_types is not None else None
     with open(drc_path) as f:
         for line in f:
             if line.startswith('Bounds'):
-                if layer is None or current_layer == layer:
+                layer_ok = layer is None or current_layer == layer
+                type_ok  = allowed_types is None or current_rule_type in allowed_types
+                if layer_ok and type_ok:
                     n += 1
             else:
                 m = _LAYER_TAG_RE.search(line)
                 if m:
                     current_layer = m.group(1)
+                m2 = _RULE_TYPE_RE.match(line)
+                if m2:
+                    current_rule_type = m2.group(1)
     return n
+
+
+def next_pow2(x):
+    """Smallest power of 2 that is >= x (x > 0)."""
+    return 1 << max(0, math.ceil(math.log2(x)))
+
+
+def pick_grid_size(die_w_um, die_h_um, target_um_per_bin,
+                    candidates=(256, 512, 1024, 2048)):
+    """
+    Resolve a design's grid_size from its physical die size, so that every
+    design gets roughly the same µm/bin instead of a fixed bin count.
+
+    grid_size = clamp(next_pow2(max(die_w,die_h) / target_um_per_bin), min, max)
+    """
+    ideal = max(die_w_um, die_h_um) / target_um_per_bin
+    g = next_pow2(ideal)
+    return min(max(g, min(candidates)), max(candidates))
+
+
+def _die_size_um(def_path):
+    """Cheap DIEAREA-only read of a DEF file (no LEF/AP/nets needed) — used
+    for the sizing pass before deciding each sample's grid_size."""
+    with open(def_path) as f:
+        content = f.read()
+    m = re.search(r'UNITS DISTANCE MICRONS (\d+)', content)
+    dbu = int(m.group(1)) if m else 4000
+    m = re.search(r'DIEAREA\s+\(\s*(\d+)\s+(\d+)\s*\)\s+\(\s*(\d+)\s+(\d+)\s*\)', content)
+    x0, y0, x1, y1 = (int(m.group(i)) for i in range(1, 5))
+    return (x1 - x0) / dbu, (y1 - y0) / dbu
 
 
 def parse_lef(lef_paths):
@@ -132,20 +174,27 @@ def load_ap_data(json_paths):
     return ap_map
 
 
-def parse_drc(drc_path, dbu, layer=None):
+def parse_drc(drc_path, dbu, layer=None, rule_types=None):
     """Return list of (cx_dbu, cy_dbu) for each DRV bounding-box centre.
 
     layer: if given (e.g. 'M2'), only violations tagged with that routing
     layer are returned (see count_drv for where the tag lives).
+    rule_types: if given (iterable of strings, e.g. {'Metal Short',
+    'EndOfLine Keepout', 'EndOfLine Spacing'}), only violations whose rule
+    type exactly matches one of these are returned.
     """
     violations = []
     pat = re.compile(
         r'Bounds\s*:\s*\(\s*([\d.]+),\s*([\d.]+)\s*\)\s*\(\s*([\d.]+),\s*([\d.]+)\s*\)')
     current_layer = None
+    current_rule_type = None
+    allowed_types = set(rule_types) if rule_types is not None else None
     with open(drc_path) as f:
         for line in f:
             if line.startswith('Bounds'):
                 if layer is not None and current_layer != layer:
+                    continue
+                if allowed_types is not None and current_rule_type not in allowed_types:
                     continue
                 bm = pat.search(line)
                 if bm:
@@ -158,6 +207,9 @@ def parse_drc(drc_path, dbu, layer=None):
                 m = _LAYER_TAG_RE.search(line)
                 if m:
                     current_layer = m.group(1)
+                m2 = _RULE_TYPE_RE.match(line)
+                if m2:
+                    current_rule_type = m2.group(1)
     return violations
 
 
@@ -406,6 +458,47 @@ class RUDYMapModel(nn.Module):
         return self.rudy_map
 
 
+class NetCountMapModel(nn.Module):
+    """
+    Unweighted net-count congestion map.
+
+    For each signal net, +1 is accumulated uniformly over every grid bin
+    covered by its bounding box (unlike RUDY, which weights by
+    (W+H)/(W*H) — a net spanning many bins contributes the same +1 per bin
+    as a small local net). This gives a plain routing-demand density signal
+    that complements RUDY's size-weighted one; net_count showed decent
+    standalone AUC (~0.70) against DRV in earlier feature-correlation
+    studies (see fcn_trainer memory) and is cheap since it reuses the same
+    net bounding boxes already parsed for RUDY.
+
+    Normalised to [0, 1].
+    """
+
+    def __init__(self, net_data, die, grid_size=256):
+        super().__init__()
+        G = grid_size
+        x0, y0, x1d, y1d = die
+        die_w, die_h = x1d - x0, y1d - y0
+        bins = (np.arange(G, dtype=np.float32) + 0.5) / G
+        arr  = np.zeros((G, G), dtype=np.float32)
+
+        for _pins, xmin, xmax, ymin, ymax in net_data:
+            xn0 = (xmin - x0) / die_w; xn1 = (xmax - x0) / die_w
+            yn0 = (ymin - y0) / die_h; yn1 = (ymax - y0) / die_h
+            cols = np.where((bins >= xn0) & (bins <= xn1))[0]
+            rows = np.where((bins >= yn0) & (bins <= yn1))[0]
+            if rows.size and cols.size:
+                arr[np.ix_(rows, cols)] += 1.0
+
+        mx = arr.max()
+        if mx > 0:
+            arr /= mx
+        self.register_buffer('net_count_map', torch.from_numpy(arr))
+
+    def forward(self):
+        return self.net_count_map
+
+
 class M3StripeMapModel(nn.Module):
     """
     PDN proximity map: 1 / (1 + distance_to_nearest_M3_stripe_edge_in_bins).
@@ -491,6 +584,7 @@ def build_maps(
     cell_min_sigma_bins=1.0,
     drv_sigma_bins=10.0,
     drv_layer=None,
+    drv_rule_types=None,
     verbose=True,
 ):
     """
@@ -498,11 +592,14 @@ def build_maps(
 
     drv_layer: if given (e.g. 'M2'), the DRV ground-truth map only includes
     violations on that routing layer.
+    drv_rule_types: if given (e.g. {'Metal Short', 'EndOfLine Keepout',
+    'EndOfLine Spacing'}), the DRV ground-truth map only includes violations
+    of those rule types.
 
     Returns
     -------
     (pin_density_model, ap_model, cell_type_model, aoi_model, rudy_model,
-     m3_stripe_model, drv_model)
+     net_count_model, m3_stripe_model, drv_model)
     """
     def log(msg):
         if verbose:
@@ -516,7 +613,7 @@ def build_maps(
     x0, y0, x1, y1 = die
     die_w, die_h = x1 - x0, y1 - y0
     ap_lookup  = load_ap_data(ap_json_paths)
-    violations = parse_drc(drc_path, dbu, layer=drv_layer)
+    violations = parse_drc(drc_path, dbu, layer=drv_layer, rule_types=drv_rule_types)
 
     with open(def_path) as _f:
         _def_content = _f.read()
@@ -568,7 +665,8 @@ def build_maps(
         cx_t[aoi_t], cy_t[aoi_t], sx_t[aoi_t], sy_t[aoi_t], aoi_pin, G)
     log(f"  aoi/oai cells: {aoi_t.sum().item()}")
 
-    rudy_model = RUDYMapModel(net_data, die, G)
+    rudy_model      = RUDYMapModel(net_data, die, G)
+    net_count_model = NetCountMapModel(net_data, die, G)
 
     stripes = parse_m3_stripes(_def_content)
     m3_stripe_model = M3StripeMapModel(die, stripes, G)
@@ -577,7 +675,7 @@ def build_maps(
     drv_model  = DRVMapModel(violations, die, G, drv_sigma_bins=drv_sigma_bins)
 
     return (pin_density_model, ap_model, cell_type_model, aoi_model, rudy_model,
-            m3_stripe_model, drv_model)
+            net_count_model, m3_stripe_model, drv_model)
 
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -589,9 +687,11 @@ def process_sample(
     grid_size=256,
     drv_limit=DEFAULT_DRV_LIMIT,
     drv_layer=None,
+    drv_rule_types=None,
     save_plots=False,
     plot_dpi=200,
     verbose=True,
+    extra_meta=None,
     **smooth_kwargs,
 ):
     """
@@ -599,10 +699,13 @@ def process_sample(
 
     drv_layer: if given (e.g. 'M2'), the DRV target/count is restricted to
     violations on that routing layer.
+    drv_rule_types: if given (e.g. {'Metal Short', 'EndOfLine Keepout',
+    'EndOfLine Spacing'}), the DRV target/count is restricted to violations
+    of those rule types.
 
     The .pt file contains:
-      maps     – float32 (7, G, G): [pin_density, ap, cell_type, aoi, rudy, m3_inv_dist, drv]
-      meta     – dict: sample name, drv count, grid size, smoothing config, drv_layer
+      maps     – float32 (8, G, G): [pin_density, ap, cell_type, aoi, rudy, net_count, m3_inv_dist, drv]
+      meta     – dict: sample name, drv count, grid size, smoothing config, drv_layer, drv_rule_types
 
     Returns the output path, or None if skipped.
     """
@@ -613,7 +716,7 @@ def process_sample(
         return None
 
     drc_path = drc_files[0]
-    n_drv    = count_drv(drc_path, layer=drv_layer)
+    n_drv    = count_drv(drc_path, layer=drv_layer, rule_types=drv_rule_types)
 
     if n_drv == 0:
         if verbose:
@@ -629,9 +732,10 @@ def process_sample(
         print(f"  proc  {os.path.basename(sample_dir):40s}  drv={n_drv}")
 
     (pin_density_model, ap_model, cell_type_model,
-     aoi_model, rudy_model, m3_stripe_model, drv_model) = build_maps(
+     aoi_model, rudy_model, net_count_model, m3_stripe_model, drv_model) = build_maps(
         def_path, lef_paths, ap_json_paths, drc_path,
-        grid_size=grid_size, drv_layer=drv_layer, verbose=verbose, **smooth_kwargs)
+        grid_size=grid_size, drv_layer=drv_layer, drv_rule_types=drv_rule_types,
+        verbose=verbose, **smooth_kwargs)
 
     with torch.no_grad():
         pin_density_map = pin_density_model()
@@ -639,12 +743,14 @@ def process_sample(
         cell_type_map   = cell_type_model()
         aoi_map         = aoi_model()
         rudy_map        = rudy_model()
+        net_count_map   = net_count_model()
         m3_map          = m3_stripe_model()
         drv_map         = drv_model()
 
     maps_tensor = torch.stack(
-        [pin_density_map, ap_map, cell_type_map, aoi_map, rudy_map, m3_map, drv_map],
-        dim=0)  # (7,G,G)
+        [pin_density_map, ap_map, cell_type_map, aoi_map, rudy_map, net_count_map,
+         m3_map, drv_map],
+        dim=0)  # (8,G,G)
 
     os.makedirs(out_dir, exist_ok=True)
     sample_name = os.path.basename(sample_dir)
@@ -656,18 +762,22 @@ def process_sample(
             'sample':    sample_name,
             'n_drv':     n_drv,
             'drv_layer': drv_layer,
+            'drv_rule_types': sorted(drv_rule_types) if drv_rule_types else None,
             'grid_size': grid_size,
             'smooth':    smooth_kwargs,
-            'map_keys':  ['pin_density', 'ap', 'cell_type', 'aoi', 'rudy', 'm3_inv_dist', 'drv'],
+            'map_keys':  ['pin_density', 'ap', 'cell_type', 'aoi', 'rudy', 'net_count',
+                          'm3_inv_dist', 'drv'],
+            **(extra_meta or {}),
         },
     }, out_path)
 
     if save_plots:
         plot_dir = os.path.join(out_dir, 'plots', sample_name)
-        visualize_maps(pin_density_map, ap_map, cell_type_map, aoi_map, rudy_map, m3_map, drv_map,
+        visualize_maps(pin_density_map, ap_map, cell_type_map, aoi_map, rudy_map,
+                       net_count_map, m3_map, drv_map,
                        os.path.join(plot_dir, 'feature_maps.png'))
-        save_individual_maps(pin_density_map, ap_map, cell_type_map, aoi_map, rudy_map, m3_map, drv_map,
-                             plot_dir, dpi=plot_dpi)
+        save_individual_maps(pin_density_map, ap_map, cell_type_map, aoi_map, rudy_map,
+                             net_count_map, m3_map, drv_map, plot_dir, dpi=plot_dpi)
 
     return out_path
 
@@ -681,6 +791,7 @@ def process_batch(
     grid_size=256,
     drv_limit=DEFAULT_DRV_LIMIT,
     drv_layer=None,
+    drv_rule_types=None,
     save_plots=False,
     plot_dpi=200,
     verbose=True,
@@ -693,11 +804,15 @@ def process_batch(
 
     drv_layer: if given (e.g. 'M2'), restrict the DRV target/count to that
     routing layer for every sample.
+    drv_rule_types: if given (e.g. {'Metal Short', 'EndOfLine Keepout',
+    'EndOfLine Spacing'}), restrict the DRV target/count to those rule types
+    for every sample.
     """
     candidates = sorted([e.path for e in os.scandir(data_dir) if e.is_dir()])
 
     print(f"Batch processing: {len(candidates)} subdirectories in {data_dir}")
-    print(f"  drv_limit={drv_limit}  drv_layer={drv_layer}  save_plots={save_plots}  out={out_dir}\n")
+    print(f"  drv_limit={drv_limit}  drv_layer={drv_layer}  "
+          f"drv_rule_types={drv_rule_types}  save_plots={save_plots}  out={out_dir}\n")
 
     saved, skipped_no_files, skipped_drv = [], 0, 0
 
@@ -705,6 +820,7 @@ def process_batch(
         result = process_sample(
             sample_dir, lef_paths, ap_json_paths, out_dir,
             grid_size=grid_size, drv_limit=drv_limit, drv_layer=drv_layer,
+            drv_rule_types=drv_rule_types,
             save_plots=save_plots, plot_dpi=plot_dpi,
             verbose=verbose, **smooth_kwargs)
 
@@ -724,11 +840,148 @@ def process_batch(
         'grid_size': grid_size,
         'drv_limit': drv_limit,
         'drv_layer': drv_layer,
+        'drv_rule_types': sorted(drv_rule_types) if drv_rule_types else None,
         'n_saved':   len(saved),
         'n_skipped_no_files': skipped_no_files,
         'n_skipped_drv':      skipped_drv,
         'smooth':    smooth_kwargs,
         'samples':   [os.path.basename(p) for p in saved],
+    }
+    manifest_path = os.path.join(out_dir, 'manifest.json')
+    os.makedirs(out_dir, exist_ok=True)
+    with open(manifest_path, 'w') as f:
+        json.dump(manifest, f, indent=2)
+
+    print(f"\nDone.  saved={len(saved)}  "
+          f"skipped(no files)={skipped_no_files}  "
+          f"skipped(drv≥{drv_limit})={skipped_drv}")
+    print(f"Manifest → {manifest_path}")
+    return saved
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# Batch processing — dynamic per-design resolution
+# ──────────────────────────────────────────────────────────────────────────────
+
+def process_batch_dynamic(
+    data_dir, out_dir, lef_paths, ap_json_paths,
+    target_um_per_bin=1.0,
+    grid_candidates=(256, 512, 1024, 2048),
+    min_bucket_samples=8,
+    drv_limit=DEFAULT_DRV_LIMIT,
+    drv_layer=None,
+    drv_rule_types=None,
+    save_plots=False,
+    plot_dpi=200,
+    verbose=True,
+    **smooth_kwargs,
+):
+    """
+    Like process_batch, but each sample gets its own grid_size resolved from
+    its physical die size, so µm/bin stays roughly constant across designs
+    instead of a fixed 256x256 warping every design to a different physical
+    scale.
+
+    grid_size = clamp(next_pow2(max(die_w,die_h) / target_um_per_bin), min, max)
+    over `grid_candidates`. Buckets smaller than `min_bucket_samples` (too few
+    samples to form a meaningful batch, and often the most expensive bucket
+    per epoch) are merged down into the next smaller candidate.
+
+    `cell_min_sigma_bins` / `drv_sigma_bins` in smooth_kwargs are interpreted
+    as bin counts AT `target_um_per_bin` (i.e. they encode a physical size in
+    µm = value * target_um_per_bin); each sample gets its own effective bin
+    count so the actual blur stays the same physical size regardless of which
+    bucket it lands in.
+    """
+    candidates = sorted(grid_candidates)
+    sample_dirs = sorted([e.path for e in os.scandir(data_dir) if e.is_dir()])
+
+    print(f"Batch processing (dynamic bins): {len(sample_dirs)} subdirectories in {data_dir}")
+    print(f"  target_um_per_bin={target_um_per_bin}  candidates={candidates}  "
+          f"min_bucket_samples={min_bucket_samples}  out={out_dir}\n")
+
+    # ── pass 1: die size + ideal grid_size per sample (cheap DEF-only read) ──
+    infos = []   # [sample_dir, die_w_um, die_h_um, grid_size]
+    skipped_no_files = 0
+    for sample_dir in sample_dirs:
+        def_path = os.path.join(sample_dir, 'contest.gp.def')
+        drc_files = glob.glob(os.path.join(sample_dir, '*.drc.rpt'))
+        if not os.path.isfile(def_path) or not drc_files:
+            skipped_no_files += 1
+            continue
+        die_w, die_h = _die_size_um(def_path)
+        g = pick_grid_size(die_w, die_h, target_um_per_bin, candidates)
+        infos.append([sample_dir, die_w, die_h, g])
+
+    # ── pass 2: merge buckets below min_bucket_samples down to the next
+    #    smaller candidate, repeated until stable ──────────────────────────
+    for _ in range(len(candidates)):
+        counts = {}
+        for info in infos:
+            counts[info[3]] = counts.get(info[3], 0) + 1
+        moved = False
+        for info in infos:
+            if counts[info[3]] < min_bucket_samples:
+                smaller = [c for c in candidates if c < info[3]]
+                if smaller:
+                    info[3] = max(smaller)
+                    moved = True
+        if not moved:
+            break
+
+    bucket_counts = {}
+    for info in infos:
+        bucket_counts[info[3]] = bucket_counts.get(info[3], 0) + 1
+    print("Resolved grid_size buckets:")
+    for g in sorted(bucket_counts):
+        print(f"  {g:5d}  ->  {bucket_counts[g]:4d} samples")
+    print()
+
+    # ── pass 3: process each sample at its resolved grid_size, with
+    #    physical-scale-consistent sigmas ───────────────────────────────────
+    base_drv_sigma_bins = smooth_kwargs.get('drv_sigma_bins', 10.0)
+    base_cell_min_sigma_bins = smooth_kwargs.get('cell_min_sigma_bins', 1.0)
+    drv_sigma_um = base_drv_sigma_bins * target_um_per_bin
+    cell_min_sigma_um = base_cell_min_sigma_bins * target_um_per_bin
+
+    saved, skipped_drv = [], 0
+    for sample_dir, die_w, die_h, g in infos:
+        um_per_bin = max(die_w, die_h) / g
+        eff_smooth = dict(smooth_kwargs)
+        eff_smooth['drv_sigma_bins'] = drv_sigma_um / um_per_bin
+        eff_smooth['cell_min_sigma_bins'] = cell_min_sigma_um / um_per_bin
+
+        result = process_sample(
+            sample_dir, lef_paths, ap_json_paths, out_dir,
+            grid_size=g, drv_limit=drv_limit, drv_layer=drv_layer,
+            drv_rule_types=drv_rule_types,
+            save_plots=save_plots, plot_dpi=plot_dpi, verbose=verbose,
+            extra_meta=dict(die_w_um=die_w, die_h_um=die_h,
+                             um_per_bin=um_per_bin,
+                             target_um_per_bin=target_um_per_bin),
+            **eff_smooth)
+
+        if result is None:
+            skipped_drv += 1
+        else:
+            saved.append(result)
+
+    manifest = {
+        'data_dir':   data_dir,
+        'out_dir':    out_dir,
+        'dynamic_bins': True,
+        'target_um_per_bin': target_um_per_bin,
+        'grid_candidates':   candidates,
+        'min_bucket_samples': min_bucket_samples,
+        'bucket_counts': {str(k): v for k, v in sorted(bucket_counts.items())},
+        'drv_limit':  drv_limit,
+        'drv_layer':  drv_layer,
+        'drv_rule_types': sorted(drv_rule_types) if drv_rule_types else None,
+        'n_saved':    len(saved),
+        'n_skipped_no_files': skipped_no_files,
+        'n_skipped_drv':      skipped_drv,
+        'smooth':     smooth_kwargs,
+        'samples':    [os.path.basename(p) for p in saved],
     }
     manifest_path = os.path.join(out_dir, 'manifest.json')
     os.makedirs(out_dir, exist_ok=True)
@@ -785,6 +1038,15 @@ class PlacementMapDataset(Dataset):
         self.input_keys = tuple(input_keys)
         self.input_idx  = [key_idx[k] for k in input_keys]
         self.target_idx = key_idx[target_key]
+
+        # Per-file grid_size (native H=W of that sample's stored maps), read
+        # once up front so a bucket batch sampler can group same-size samples
+        # into batches without a second pass over the data (see train.py's
+        # BucketBatchSampler, used when --dynamic_bins produced variable-size
+        # .pt files).
+        self.grid_sizes = [
+            torch.load(f, weights_only=True)['meta']['grid_size'] for f in self.files
+        ]
 
     def __len__(self):
         return len(self.files)
@@ -852,6 +1114,7 @@ _MAP_CFGS = [
     ('cell_type_map',   'Cell-Type Mixture\n(complexity)',   'RdPu'),
     ('aoi_map',         'AOI/OAI Density\n(aoi*/oai*)',      'YlOrRd'),
     ('rudy_map',        'RUDY\n(routing demand)',            'OrRd'),
+    ('net_count_map',   'Net Count\n(unweighted density)',   'PuBu'),
     ('m3_map',          'M3 PDN Proximity\n(inv-dist to stripe)', 'viridis'),
     ('drv_map',         'DRV Map\n(ground truth)',           'hot'),
 ]
@@ -861,11 +1124,13 @@ def _stat_label(data):
     return f'min={data.min():.4f}  max={data.max():.4f}  mean={data.mean():.5f}'
 
 
-def visualize_maps(density_map, ap_map, cell_type_map, aoi_map, rudy_map, m3_map, drv_map, out_path):
-    """Save a 1×7 panel PNG at 150 dpi."""
+def visualize_maps(density_map, ap_map, cell_type_map, aoi_map, rudy_map, net_count_map,
+                   m3_map, drv_map, out_path):
+    """Save a 1×8 panel PNG at 150 dpi."""
     os.makedirs(os.path.dirname(out_path) or '.', exist_ok=True)
-    tensors = [density_map, ap_map, cell_type_map, aoi_map, rudy_map, m3_map, drv_map]
-    fig, axes = plt.subplots(1, 7, figsize=(42, 6.5))
+    tensors = [density_map, ap_map, cell_type_map, aoi_map, rudy_map, net_count_map,
+              m3_map, drv_map]
+    fig, axes = plt.subplots(1, 8, figsize=(48, 6.5))
     fig.patch.set_facecolor('#12121e')
 
     for ax, tensor, (_fname, title, cmap) in zip(axes, tensors, _MAP_CFGS):
@@ -888,11 +1153,12 @@ def visualize_maps(density_map, ap_map, cell_type_map, aoi_map, rudy_map, m3_map
     plt.close()
 
 
-def save_individual_maps(density_map, ap_map, cell_type_map, aoi_map, rudy_map, m3_map, drv_map,
-                         out_dir, dpi=300):
-    """Save seven individual high-resolution PNGs into out_dir."""
+def save_individual_maps(density_map, ap_map, cell_type_map, aoi_map, rudy_map, net_count_map,
+                         m3_map, drv_map, out_dir, dpi=300):
+    """Save eight individual high-resolution PNGs into out_dir."""
     os.makedirs(out_dir, exist_ok=True)
-    tensors = [density_map, ap_map, cell_type_map, aoi_map, rudy_map, m3_map, drv_map]
+    tensors = [density_map, ap_map, cell_type_map, aoi_map, rudy_map, net_count_map,
+              m3_map, drv_map]
 
     for tensor, (fname, title, cmap) in zip(tensors, _MAP_CFGS):
         data = tensor.detach().cpu().numpy()
@@ -929,12 +1195,29 @@ def _make_parser():
     p.add_argument('--drv_layer',  type=str,   default=None,
                    help="Restrict DRV target/count to one routing layer, e.g. 'M2' "
                         "(default: None = all layers combined)")
+    p.add_argument('--drv_rule_types', type=str, default=None,
+                   help="Comma-separated DRC rule types to restrict the DRV "
+                        "target/count to, e.g. 'Metal Short,EndOfLine Keepout,"
+                        "EndOfLine Spacing' (default: None = all rule types)")
     p.add_argument('--save_plots', action='store_true')
     p.add_argument('--plot_dpi',   type=int,   default=200)
     p.add_argument('--grid_size',  type=int,   default=256)
     p.add_argument('--cell_smooth_factor',  type=float, default=1.0)
     p.add_argument('--cell_min_sigma_bins', type=float, default=1.0)
     p.add_argument('--drv_sigma_bins',      type=float, default=10.0)
+    p.add_argument('--dynamic_bins', action='store_true',
+                   help='Resolve grid_size per-sample from physical die size '
+                        'instead of a fixed --grid_size (batch mode only). '
+                        '--cell_min_sigma_bins/--drv_sigma_bins are then '
+                        'interpreted as bin counts at --target_um_per_bin.')
+    p.add_argument('--target_um_per_bin', type=float, default=1.0,
+                   help='Target physical bin size in µm when --dynamic_bins '
+                        'is set (default 1.0)')
+    p.add_argument('--grid_candidates', type=str, default='256,512,1024,2048',
+                   help='Comma-separated grid_size candidates for --dynamic_bins')
+    p.add_argument('--min_bucket_samples', type=int, default=8,
+                   help='Buckets with fewer samples than this are merged '
+                        'down into the next smaller candidate')
     return p
 
 
@@ -953,21 +1236,35 @@ if __name__ == '__main__':
         cell_min_sigma_bins = args.cell_min_sigma_bins,
         drv_sigma_bins      = args.drv_sigma_bins,
     )
+    drv_rule_types = (set(t.strip() for t in args.drv_rule_types.split(','))
+                       if args.drv_rule_types else None)
 
     if args.data_dir or args.sample_dir is None:
         data_dir = args.data_dir or os.path.join(base, 'train_data')
         out_dir  = args.out_dir  or os.path.join(base, 'processed')
-        process_batch(data_dir, out_dir, lef_paths, ap_paths,
-                      grid_size=args.grid_size, drv_limit=args.drv_limit,
-                      drv_layer=args.drv_layer,
-                      save_plots=args.save_plots, plot_dpi=args.plot_dpi,
-                      **smooth)
+        if args.dynamic_bins:
+            candidates = tuple(int(c) for c in args.grid_candidates.split(','))
+            process_batch_dynamic(
+                data_dir, out_dir, lef_paths, ap_paths,
+                target_um_per_bin=args.target_um_per_bin,
+                grid_candidates=candidates,
+                min_bucket_samples=args.min_bucket_samples,
+                drv_limit=args.drv_limit, drv_layer=args.drv_layer,
+                drv_rule_types=drv_rule_types,
+                save_plots=args.save_plots, plot_dpi=args.plot_dpi,
+                **smooth)
+        else:
+            process_batch(data_dir, out_dir, lef_paths, ap_paths,
+                          grid_size=args.grid_size, drv_limit=args.drv_limit,
+                          drv_layer=args.drv_layer, drv_rule_types=drv_rule_types,
+                          save_plots=args.save_plots, plot_dpi=args.plot_dpi,
+                          **smooth)
     else:
         out_dir = args.out_dir or os.path.join(base, 'data', 'processed')
         result  = process_sample(
             args.sample_dir, lef_paths, ap_paths, out_dir,
             grid_size=args.grid_size, drv_limit=args.drv_limit,
-            drv_layer=args.drv_layer,
+            drv_layer=args.drv_layer, drv_rule_types=drv_rule_types,
             save_plots=args.save_plots, plot_dpi=args.plot_dpi,
             **smooth)
         if result:
