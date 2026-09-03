@@ -4,7 +4,6 @@ from functools import partial
 import torch.nn.functional as F
 from src.drv_feature_maps import build_drv_feature_maps, load_ap_lookup
 from src.drv_predictor import DRVPredictor, resolve_drv_grid_size
-from src.detail_placement import commit_node_pos_to_gpdb
 
 def get_trunc_node_pos_fn(mov_node_size, data):
     node_pos_lb = mov_node_size / 2 + data.die_ll + 1e-4
@@ -31,7 +30,9 @@ def global_placement_main(gpdb, rawdb, ps: ParamScheduler, data: PlaceData, args
 
     device = data.device
     mov_lhs, mov_rhs = data.movable_index
-    mov_node_pos, mov_node_size, expand_ratio = data.get_mov_node_info()
+    mov_node_pos, mov_node_size, expand_ratio = data.get_mov_node_info(
+        init_method=getattr(args, 'gp_init_method', 'randn_center')
+    )
     mov_node_pos = mov_node_pos.requires_grad_(True)
 
     trunc_node_pos_fn = get_trunc_node_pos_fn(mov_node_size, data)
@@ -250,9 +251,11 @@ def global_placement_main(gpdb, rawdb, ps: ParamScheduler, data: PlaceData, args
 
         if ps.rerun_route:
             log_info = True
-            # Release cached GPU memory before GR to avoid fragmentation from DRV backward passes
-            if ps.drv_grad is not None:
-                torch.cuda.empty_cache()
+            # Release cached GPU memory before GR. Unconditional: besides DRV
+            # backward-pass fragmentation, GR's pattern router has a latent
+            # allocator-state-sensitive MMU fault (dmesg Xid 31) that stays clear
+            # only when torch isn't sitting on large cached free blocks here.
+            torch.cuda.empty_cache()
             new_mov_node_size, new_expand_ratio = None, None
             if ps.use_cell_inflate:
                 output = route_inflation(
@@ -453,129 +456,6 @@ def global_placement_main(gpdb, rawdb, ps: ParamScheduler, data: PlaceData, args
         # rollback macro_pos to previous legalized results since trunc_node_pos_fn may change them
         mov_macros_idx = data.is_mov_macro[mov_lhs:mov_rhs]
         mov_node_pos.data[mov_lhs:mov_rhs][mov_macros_idx] = data.node_pos[mov_lhs:mov_rhs][mov_macros_idx]
-
-    # ── Phase 2: DRV fine-tuning (SGD on WL + density + DRV) ────────────────────
-    drv_finetune_iters = getattr(args, 'drv_finetune_iters', 0)
-    if drv_predictor is not None and ps.drv_weight > 0 and drv_finetune_iters > 0:
-        drv_predictor.out_dir = drv_predictor.phase2_out_dir  # switch to phase2 dir
-        logger.info(f"[DRV] Starting fine-tuning phase ({drv_finetune_iters} iters, "
-                    f"drv_weight={ps.drv_weight}, density_weight={ps.density_weight:.4E})")
-
-        # Lower target density for Phase 2 if requested
-        ft_target_density = getattr(args, 'drv_finetune_target_density', -1.0)
-        if ft_target_density < 0:
-            ft_target_density = args.target_density
-        ft_obj_and_grad_fn = obj_and_grad_fn  # default: same as Phase 1
-        if ft_target_density != args.target_density:
-            # Increase init_density_map by the delta so overflow fires earlier,
-            # effectively lowering the available capacity for movable cells.
-            delta = args.target_density - ft_target_density
-            ft_init_density_map = init_density_map + delta
-            ft_obj_and_grad_fn = partial(
-                calc_obj_and_grad,
-                constraint_fn=trunc_node_pos_fn,
-                route_fn=calc_route_force,
-                mov_node_size=mov_node_size,
-                expand_ratio=expand_ratio,
-                init_density_map=ft_init_density_map,
-                density_map_layer=density_map_layer,
-                conn_fix_node_pos=conn_fix_node_pos,
-                ps=ps,
-                data=data,
-                args=args,
-            )
-            logger.info(f"[DRV] Phase 2 target_density={ft_target_density} (delta={delta:.3f})")
-
-        # Compute initial DRV gradient and cache in ps.drv_grad for calc_obj_and_grad
-        torch.cuda.empty_cache()
-        ps.drv_grad, drv_l2_loss = drv_predictor.compute_force(
-            mov_node_pos, data, gpdb, grid_size=drv_predictor.grid_size)
-        torch.cuda.synchronize()
-
-        # Reuse Phase 1's final alpha_k only as an initial guess — it is a
-        # Barzilai-Borwein step size tuned for Nesterov's momentum update and
-        # its own backtracking loop, not a safe multiplier for a plain SGD
-        # step. Near Phase 1 convergence gradients are nearly flat, so alpha_k
-        # can be enormous; applied blindly here it overshoots and blows up
-        # the placement (overflow saturates near 1.0). Guard it with a simple
-        # backtracking safeguard: if a step increases overflow too much,
-        # undo it and halve the step size.
-        phase1_alpha = None
-        if optimizer.param_groups[0]['alpha_k']:
-            phase1_alpha = optimizer.param_groups[0]['alpha_k'][0].item()
-        if phase1_alpha is None or not (phase1_alpha > 0 and phase1_alpha < float('inf')):
-            phase1_alpha = args.lr
-        ft_lr = phase1_alpha
-        logger.info(f"[DRV] SGD lr={ft_lr:.4E}  DRV_L2={drv_l2_loss:.4E}")
-
-        overflow_entry = overflow  # overflow at Phase 2 entry (from Phase 1 best solution)
-        max_backtrack = 8
-        overflow_slack = 0.05
-
-        for ft_i in range(drv_finetune_iters):
-            # Refresh DRV gradient every drv_pred_freq steps
-            if ft_i % args.drv_pred_freq == 0:
-                torch.cuda.empty_cache()
-                ps.drv_grad, drv_l2_loss = drv_predictor.compute_force(
-                    mov_node_pos, data, gpdb, grid_size=drv_predictor.grid_size)
-                torch.cuda.synchronize()
-
-            # SGD step: compute WL + density + DRV gradient, then update.
-            # Backtrack (halve ft_lr) if the step overshoots and pushes
-            # overflow past its Phase-2-entry value by more than the slack.
-            # overflow_entry is fixed for all of Phase 2, not updated per
-            # step, otherwise the guard only bounds step-to-step overflow
-            # increase and lets overflow ratchet upward without limit.
-            _, grad = ft_obj_and_grad_fn(mov_node_pos)
-            prev_pos = mov_node_pos.data.clone()
-            for backtrack_cnt in range(max_backtrack + 1):
-                with torch.no_grad():
-                    mov_node_pos.data = prev_pos - ft_lr * grad
-                trunc_node_pos_fn(mov_node_pos)
-                _, trial_overflow = evaluator_fn(mov_node_pos)
-                if trial_overflow <= overflow_entry + overflow_slack or backtrack_cnt == max_backtrack:
-                    break
-                ft_lr *= 0.5
-
-            if ft_i % 10 == 0:
-                hpwl, overflow = evaluator_fn(mov_node_pos)
-                logger.info(
-                    f"[DRV finetune] {ft_i}/{drv_finetune_iters} | "
-                    f"hpwl={hpwl:.4E} overflow={overflow:.4f} DRV_L2={drv_l2_loss:.4E} "
-                    f"lr={ft_lr:.4E}"
-                )
-
-                if getattr(args, 'exp', False):
-                    # data.design_name may itself contain a path separator
-                    # (e.g. "xplace_work/seed"), so derive the file stem from
-                    # its basename and always ensure the prefix's parent dir
-                    # exists -- gpdb.write_placement() does not create missing
-                    # directories and fails silently otherwise.
-                    dump_dir = os.path.join('exp', 'phase2_def')
-                    os.makedirs(dump_dir, exist_ok=True)
-                    dump_node_pos = torch.cat(
-                        [mov_node_pos[mov_lhs:mov_rhs], data.node_pos[mov_rhs:]], dim=0
-                    )
-                    commit_node_pos_to_gpdb(dump_node_pos, gpdb, data)
-                    design_stem = os.path.basename(data.design_name)
-                    dump_prefix = os.path.join(dump_dir, f"{design_stem}_ft{ft_i:05d}")
-                    gpdb.write_placement(dump_prefix)
-                    logger.info(f"[DRV finetune] Dumped DEF to {dump_prefix}")
-                feat_vis = build_drv_feature_maps(
-                    mov_node_pos, data, gpdb,
-                    ap_lookup=drv_predictor.ap_lookup,
-                    grid_size=drv_predictor.grid_size,
-                )
-                drv_pred_vis = drv_predictor.step(feat_vis, ft_i, overflow)
-                if drv_predictor._has_mpl:
-                    stem = f"{drv_predictor.design_name}_iter{ft_i:05d}_ovfl{overflow:.3f}"
-                    # drv_predictor.save_drv_png(
-                    #     drv_pred_vis, ft_i, overflow, drv_l2_loss,
-                    #     os.path.join(drv_predictor.out_dir, stem + '_drv.png'),
-                    # )
-
-        ps.drv_grad = None
-        logger.info(f"[DRV] Fine-tuning done. Final DRV L2: {drv_l2_loss:.4E}")
 
     # Free DRV model from GPU before GR to avoid VRAM contention
     if drv_predictor is not None:

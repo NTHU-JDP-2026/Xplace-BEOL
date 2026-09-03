@@ -29,6 +29,7 @@ def get_option():
     parser.add_argument('--target_density', type=float, default=1.0, help='max allowed cell density per bin [0,1]; lower = more spread out (e.g. 0.8 for ~20pct whitespace buffer per bin)')
     parser.add_argument('--use_filler', type=str2bool, default=True, help='placement filler')
     parser.add_argument('--noise_ratio', type=float, default=0.025, help='noise ratio for initialization')
+    parser.add_argument('--gp_init_method', type=str, default='randn_center', choices=['randn_center', 'randn_center_lxly', 'given'], help="initial movable cell positions for GP: 'randn_center' (default, spread from die centre) or 'given' (warm-start from the input DEF/pl positions)")
     parser.add_argument('--ignore_net_degree', type=int, default=100, help='threshold of net degree to ignore in wirelength calculation')
     parser.add_argument('--use_eplace_nesterov', type=str2bool, default=True, help='enable eplace nesterov optimizer')
     parser.add_argument('--clamp_node', type=str2bool, default=True, help='enable eplace node clamp trick')
@@ -105,12 +106,6 @@ def get_option():
     parser.add_argument('--drv_force_weight', type=float, default=0.0,
                         help='Weight for differentiable DRV gradient force in the Nesterov objective. '
                              '0 = disabled. Start around 1e-3 and tune relative to density_weight.')
-    parser.add_argument('--drv_finetune_iters', type=int, default=0,
-                        help='Number of DRV fine-tuning iterations after GP convergence. '
-                             '0 = disabled. DRV force is only applied in this phase, not during main GP.')
-    parser.add_argument('--drv_finetune_target_density', type=float, default=-1.0,
-                        help='Target density for Phase 2 DRV fine-tuning. '
-                             '-1 = same as --target_density. Lower value pushes cells further apart.')
     parser.add_argument('--drv_grad_ema', type=float, default=0.7,
                         help='EMA decay for DRV gradient (0=replace every step, 1=never update). '
                              '0.5 recommended to smooth oscillation.')
