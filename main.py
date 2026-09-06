@@ -115,9 +115,7 @@ def get_option():
                         help='Run DRV inference for visualisation every N iters during Phase 1 (after drv_pred_overflow). '
                              '0 = disabled. Default: follows --exp (see bottom of get_option)')
     parser.add_argument('--exp', type=str2bool, default=False,
-                        help='Experiment mode. If True: write a DEF snapshot every 10 Phase-2 '
-                             'DRV fine-tuning iterations to ./exp/phase2_def, and also write the '
-                             'run log to ./exp/phase2_log. Also turns on the auxiliary '
+                        help='Experiment mode. If True, turns on the auxiliary '
                              'visualization/debug options below (draw_placement, visualize_cgmap, '
                              'verbose_cpp_log, drv_phase1_vis_freq) unless explicitly overridden on '
                              'the command line. Default False.')

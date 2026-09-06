@@ -79,7 +79,6 @@ docker exec ${DOCKER_CTR} bash -c \
   --use_route_force false \
   --use_cell_inflate true \
   --min_area_inc 0.005 \
-  --congest_weight 0.1 \
   --deterministic True \
   --drv_ap_json fcn_trainer/SL_modified_m2_ap.json,fcn_trainer/L_modified_m2_ap.json" 2>&1
 

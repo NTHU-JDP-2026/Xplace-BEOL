@@ -604,9 +604,6 @@ def run_placement_main_nesterov(args, logger):
         drv_predictor = DRVPredictor(
             args.drv_checkpoint, device, drv_out,
             design_name=args.design_name)
-        drv_predictor.phase2_out_dir = os.path.join(
-            args.result_dir, args.exp_id, args.output_dir, 'drv_pred', 'phase2')
-        os.makedirs(drv_predictor.phase2_out_dir, exist_ok=True)
         ap_paths = [p.strip() for p in args.drv_ap_json.split(',') if p.strip()]
         drv_predictor.ap_lookup = load_ap_lookup(ap_paths)
 
