@@ -43,6 +43,8 @@ def get_option():
     parser.add_argument('--use_m3_snet_density', type=str2bool, default=False, help='add M3 power stripe virtual blockage to density map, pushing cells away from PDN regions to reduce routing DRV')
     parser.add_argument('--m3_stripe_density', type=float, default=0.7, help='max allowed cell density in M3 stripe bins [0, target_density]; lower = stronger repulsion (e.g. 0.34 with target_density=0.85 means M3 bins allow at most 34%% cell fill)')
     parser.add_argument('--m3_stripe_density_min', type=float, default=0.3, help='minimum effective cell density allowed for M3 stripe bins during dynamic DRV-guided density updates')
+    parser.add_argument('--adaptive_congest_rc', type=float, default=0.0, help='RC-Hor threshold for the adaptive congestion profile. A metrics-only global route runs just before the first dynamic M3 density update; if it reports RC Hor >= this value the design is treated as congested and m3_stripe_density_min is lowered to --adaptive_m3_stripe_density_min. 0 disables (default). Calibrated value for the ISPD2023 set at util 60: 1.43.')
+    parser.add_argument('--adaptive_m3_stripe_density_min', type=float, default=0.1, help='m3_stripe_density_min to switch to when --adaptive_congest_rc fires')
     parser.add_argument('--drv_density_update_overflow', type=float, default=0.1, help='overflow threshold below which dynamic M3 density updates are activated')
     parser.add_argument('--drv_density_update_freq', type=int, default=100, help='run DRV inference and update M3 bin densities every N iterations once activated')
     parser.add_argument('--drv_density_update_step', type=float, default=0.02, help='amount to reduce effective density per hot M3 bin per update step')

@@ -128,6 +128,24 @@ def global_placement_main(gpdb, rawdb, ps: ParamScheduler, data: PlaceData, args
     density_update_active = False
     density_update_count = 0
 
+    # ── Adaptive congestion profile ────────────────────────────────────────────
+    # Designs differ a lot in how congested they are, and the aggressive M3
+    # density floor is only worth its wirelength cost on the congested ones
+    # (measured, 0.10 vs 0.15 floor: cast +1.34%, seed +0.63%, aes +0.59%, but
+    # only +0.03..0.05% on misty/camellia/sha256). So decide per design, once,
+    # from a dedicated metrics-only GR fired just before the first density
+    # update — see the probe site below for why it has to be that early.
+    # RC Hor is the ACE-based routability metric from evaluate_routability();
+    # it is normalised, so a threshold transfers across designs. Calibrated at
+    # the probe point over the 6-design set: cast 1.536, seed 1.330, misty
+    # 1.311, sha256 1.201, aes 1.188, camellia 1.184 — 1.43 sits mid-gap.
+    # NB those values are specific to the probe point; the later GR inside
+    # route_inflation reads lower (cast 1.173, seed 1.072) and would need its
+    # own calibration.
+    adaptive_congest_rc = getattr(args, 'adaptive_congest_rc', 0.0)
+    adaptive_m3_min = getattr(args, 'adaptive_m3_stripe_density_min', 0.1)
+    adaptive_decided = False
+
     terminate_signal = False
     route_early_terminate_signal = False
     log_info = False
@@ -333,6 +351,38 @@ def global_placement_main(gpdb, rawdb, ps: ParamScheduler, data: PlaceData, args
         # ── Dynamic M3 density update (DRV-guided) ───────────────────────────
         if use_dynamic_density:
             if not density_update_active and overflow < drv_density_update_overflow:
+                # Decide the congestion profile here, BEFORE the first density
+                # update, so the chosen floor applies from the very first one.
+                # Reading the routability loop's own GR instead is too late: by
+                # then the run has committed to a trajectory, and a mid-flight
+                # switch lands on the mild result rather than the aggressive one
+                # (measured on cast: 2.0276E+06 vs the aggressive 2.0573E+06).
+                # One metrics-only GR costs ~0.5s of a ~25s GP.
+                if adaptive_congest_rc > 0 and not adaptive_decided:
+                    adaptive_decided = True
+                    torch.cuda.empty_cache()
+                    ps.rerun_route = True
+                    probe_metrics = run_gr_and_fft_main(
+                        args, logger, data, rawdb, gpdb, ps, mov_node_pos,
+                        constraint_fn=trunc_node_pos_fn, skip_m1_route=True,
+                        report_gr_metrics_only=True,
+                    )
+                    ps.rerun_route = False
+                    rc_hor = probe_metrics[4] if probe_metrics is not None else -1.0
+                    if rc_hor >= adaptive_congest_rc:
+                        old_min = m3_stripe_density_min
+                        m3_stripe_density_min = adaptive_m3_min
+                        logger.info(
+                            f"[AdaptiveCongest] probe at iter={iteration} "
+                            f"RC Hor={rc_hor:.3f} >= {adaptive_congest_rc:.3f} -> congested: "
+                            f"m3_stripe_density_min {old_min:.2f} -> {m3_stripe_density_min:.2f}"
+                        )
+                    else:
+                        logger.info(
+                            f"[AdaptiveCongest] probe at iter={iteration} "
+                            f"RC Hor={rc_hor:.3f} < {adaptive_congest_rc:.3f} -> not congested: "
+                            f"m3_stripe_density_min stays {m3_stripe_density_min:.2f}"
+                        )
                 density_update_active = True
                 logger.info(
                     f"[DensityUpdate] Activated at iter={iteration} overflow={overflow:.4f} "

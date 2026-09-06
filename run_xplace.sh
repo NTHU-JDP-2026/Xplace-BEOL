@@ -63,6 +63,8 @@ docker exec ${DOCKER_CTR} bash -c \
   --use_m3_snet_density True \
   --m3_stripe_density 0.5 \
   --m3_stripe_density_min 0.15 \
+  --adaptive_congest_rc 1.43 \
+  --adaptive_m3_stripe_density_min 0.1 \
   --design_name ${design_name} \
   --stop_overflow 0.07 \
   --drv_checkpoint fcn_trainer/results/dynamic_v19_aes2048_dropaoi/best_model.pt \
