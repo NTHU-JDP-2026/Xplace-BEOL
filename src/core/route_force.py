@@ -1,7 +1,6 @@
 import torch
 from cpp_to_py import gpugr
 from .dct2_fft2 import dct2, idct2, idxst_idct, idct_idxst
-from .torch_dct import torch_dct_idct
 import numpy as np
 import math
 import matplotlib.pyplot as plt

@@ -1,3 +1,5 @@
+import time
+
 from utils import *
 from src import *
 from functools import partial
@@ -239,7 +241,6 @@ def global_placement_main(gpdb, rawdb, ps: ParamScheduler, data: PlaceData, args
             for param_group in optimizer.param_groups:
                 param_group["lr"] = cur_lr.item()
             ps.reset_best_sol()
-            ps.drv_grad = None  # stale gradient is invalid after position reset
             terminate_signal = False  # reset signal
             logger.info("Re-run std cell placement with fixed macros.")
 
@@ -333,7 +334,6 @@ def global_placement_main(gpdb, rawdb, ps: ParamScheduler, data: PlaceData, args
                     )
                 )
                 ps.reset_best_sol()
-                ps.drv_grad = None  # stale gradient is invalid after position/size reset
 
         # ── DRV prediction (Phase 1: inference only, no force, no PNG) ──────
         vis_freq = getattr(args, 'drv_phase1_vis_freq', 100)

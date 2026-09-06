@@ -161,23 +161,6 @@ def single_iccad2019(dataset_root, design_name, placement=None):
     return params
 
 
-def single_ispd2018(dataset_root, design_name, placement=None):
-    # configuration
-    benchmark = "ispd2018"
-    root, all_designs = find_benchmark(dataset_root, benchmark)
-    if design_name not in all_designs:
-        raise ValueError("Design Name %s should in %s" % (design_name, all_designs))
-    params = {
-        "benchmark": benchmark,
-        "lef": "%s/%s/%s.input.lef" % (root, design_name, design_name),
-        "def": "%s/%s/%s.input.def" % (root, design_name, design_name)
-        if placement is None
-        else placement,
-        "design_name": design_name,
-    }
-    return params
-
-
 def single_iccad2015(dataset_root, benchmark, design_name, placement=None):
     # configuration
     # benchmark = "iccad2015"

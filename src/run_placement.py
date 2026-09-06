@@ -1,3 +1,7 @@
+import copy
+
+import pandas as pd
+
 from utils import *
 from src import run_placement_main_nesterov
 

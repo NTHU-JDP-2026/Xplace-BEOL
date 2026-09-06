@@ -69,7 +69,6 @@ docker exec ${DOCKER_CTR} bash -c \
   --stop_overflow 0.07 \
   --drv_checkpoint fcn_trainer/results/dynamic_v19_aes2048_dropaoi/best_model.pt \
   --drv_pred_adaptive True \
-  --drv_force_weight 0.35 \
   --drv_phase1_vis_freq 0 \
   --exp false \
   --drv_density_update_overflow 0.25 \

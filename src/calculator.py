@@ -32,7 +32,6 @@ def calc_obj_and_grad(
     if merged_forward_backward:
         wirelength_grad = torch.zeros_like(mov_node_pos)
         density_grad = torch.zeros_like(mov_node_pos)
-        drv_grad = torch.zeros_like(mov_node_pos)
         if mov_node_pos.grad is not None:
             mov_node_pos.grad.zero_()
         else:
@@ -91,20 +90,6 @@ def calc_obj_and_grad(
         if ps.zero_macro_grad:
             mov_node_pos.grad[mov_lhs:mov_rhs].masked_fill_(data.is_mov_macro[mov_lhs:mov_rhs].unsqueeze(1), 0)
 
-        if ps.drv_grad is not None and ps.drv_weight > 0:
-            # Normalise DRV gradient to the combined wirelength+density gradient
-            # magnitude so drv_weight is a dimensionless ratio (1.0 = same force
-            # as wirelength+density combined).
-            combined_grad_norm = (
-                + 0.5 * wirelength_grad[mov_lhs:mov_rhs].norm(p=1)
-                + 0.5 * density_grad[mov_lhs:mov_rhs].norm(p=1)
-            ).clamp(min=1e-9)
-            drv_grad_norm = ps.drv_grad[mov_lhs:mov_rhs].norm(p=1).clamp(min=1e-9)
-            scale = combined_grad_norm / drv_grad_norm
-            mov_node_pos.grad += ps.drv_grad * (ps.drv_weight * scale)
-
-            drv_contribution = ps.drv_grad * (ps.drv_weight * scale)
-            # print(f"wirelength_grad.norm(): {wirelength_grad.norm():.4E}, density_grad.norm(): {density_grad.norm():.4E}, drv_grad: {drv_contribution.norm():.4E}")
         grad = apply_precond(mov_node_pos, ps, args)
         loss = wl_loss + ps.density_weight * density_loss
 
