@@ -1,0 +1,324 @@
+import re
+import torch
+from .database import PlaceData
+from cpp_to_py import density_map_cuda
+from .core import merged_wl_loss_grad, merged_wl_loss_grad_timing
+
+
+def _def_special_rects(data, layers):
+    """[x, y, w, h] (DEF units) of the SPECIALNETS RECT shapes on the given layers."""
+    path = data.dataset_path.get('def') if data.dataset_format == 'lefdef' else None
+    if not path:
+        return []
+    want = set(layers)
+    out, spec = [], False
+    pat = re.compile(r'RECT (\S+) \( (-?\d+) (-?\d+) \) \( (-?\d+) (-?\d+) \)')
+    with open(path) as f:
+        for line in f:
+            if line.startswith('SPECIALNETS'):
+                spec = True
+            elif line.startswith('END SPECIALNETS'):
+                break
+            elif spec and 'RECT' in line:
+                for m in pat.finditer(line):
+                    if m.group(1) in want:
+                        x1, y1, x2, y2 = (int(m.group(i)) for i in range(2, 6))
+                        out.append([min(x1, x2), min(y1, y2), abs(x2 - x1), abs(y2 - y1)])
+    return out
+
+
+def _pg_strap_density_map(gpdb, data, args, device, logger, layers):
+    """Density map (num_bin_x, num_bin_y) of the power straps on the given layers
+    (e.g. ["M3"] stripes, ["M5"] via-pillar straps), or None if there are none."""
+    init_density_map = torch.zeros((data.num_bin_x, data.num_bin_y), device=device,
+                                   dtype=data.node_size.dtype)
+    snet_lpos_all, snet_size_all, snet_layer_all = gpdb.snet_info_tensor()
+    snet_lpos_all = snet_lpos_all.to(device)
+    snet_size_all = snet_size_all.to(device)
+    snet_layer_all = snet_layer_all.to(device)
+
+    # the straps of the given layers (routing-layer index of Mk = m1_rindex + k - 1)
+    m3_mask = torch.zeros_like(snet_layer_all, dtype=torch.bool)
+    for l in layers:
+        m3_mask |= snet_layer_all == data.m1_rindex + int(l.lstrip('Mm')) - 1
+    # The parser reads special-net paths only, not RECT shapes: straps drawn with
+    # add_shape (Innovus PG_M3_SNAP=None: + SHAPE STRIPE + RECT M5 ...) come from the DEF.
+    rects = _def_special_rects(data, layers)
+    if rects:
+        r = torch.tensor(rects, dtype=snet_lpos_all.dtype, device=device)
+        snet_lpos_all = torch.cat([snet_lpos_all, r[:, 0:2]])
+        snet_size_all = torch.cat([snet_size_all, r[:, 2:4]])
+        snet_layer_all = torch.cat([snet_layer_all, snet_layer_all.new_full((r.shape[0],), -1)])
+        m3_mask = torch.cat([m3_mask, m3_mask.new_ones(r.shape[0])])
+    # straps only: shapes over the placement area (a core ring on the same layer, e.g.
+    # M4/M5, runs outside it)
+    xl, xh, yl, yh = data.die_info.tolist()
+    cx = (snet_lpos_all[:, 0] - data.die_shift[0]) / data.die_scale[0] + snet_size_all[:, 0] / data.die_scale[0] / 2
+    m3_mask &= (cx > xl) & (cx < xh)
+    if m3_mask.sum() == 0:
+        logger.info("No %s snet segments found; skipping PG strap density reduction." % '/'.join(layers))
+        return None
+    logger.info("PG strap density: %d %s snet segments" % (int(m3_mask.sum()), '/'.join(layers)))
+
+    m3_lpos = snet_lpos_all[m3_mask, :] - data.die_shift
+    m3_lpos = m3_lpos / data.die_scale
+    m3_size = snet_size_all[m3_mask, :] / data.die_scale
+    m3_pos = m3_lpos + m3_size / 2
+    m3_weight = m3_size.new_ones(m3_size.shape[0])
+
+    aux = torch.zeros(
+        (data.num_bin_x, data.num_bin_y), device=device, dtype=init_density_map.dtype
+    )
+    m3_density_map = density_map_cuda.forward_naive(
+        m3_pos, m3_size, m3_weight, data.unit_len,
+        aux,
+        data.num_bin_x, data.num_bin_y, m3_pos.shape[0],
+        -1.0, -1.0, 1e-4, False, args.deterministic,
+    ).contiguous()
+
+    return m3_density_map
+
+
+def _apply_m3_snet_density_reduction(gpdb, data, args, init_density_map, device, logger):
+    """Add virtual blockage to bins overlapping M3 power stripes.
+
+    M3 stripe bins receive extra density so their effective cell capacity
+    becomes m3_stripe_density instead of target_density, pushing cells away
+    from PDN regions to reduce routing DRV.
+    """
+    m3_stripe_density = getattr(args, 'm3_stripe_density', 0.7)
+    if not (0.0 <= m3_stripe_density < args.target_density):
+        logger.warning(
+            "m3_stripe_density=%.2f is not in [0, target_density=%.2f); skipping M3 density reduction." % (
+                m3_stripe_density, args.target_density)
+        )
+        return
+
+    m3_density_map = _pg_strap_density_map(gpdb, data, args, device, logger, ['M3'])
+    if m3_density_map is None:
+        return
+
+    # virtual_blockage fills each M3 bin up to target_density - m3_stripe_density,
+    # leaving only m3_stripe_density of capacity available for movable cells.
+    m3_bin_mask = m3_density_map > 0
+    virtual_blockage = m3_bin_mask.float() * (args.target_density - m3_stripe_density)
+    init_density_map.add_(virtual_blockage).clamp_(max=args.target_density)
+
+    # Expose M3 state on data for dynamic density updates
+    data.m3_bin_mask = m3_bin_mask  # bool (num_bin_x, num_bin_y)
+    data.m3_bin_effective_density = torch.full(
+        (data.num_bin_x, data.num_bin_y), args.target_density,
+        device=device, dtype=init_density_map.dtype
+    )
+    data.m3_bin_effective_density[m3_bin_mask] = m3_stripe_density
+
+    num_affected = m3_bin_mask.sum().item()
+    total_bins = data.num_bin_x * data.num_bin_y
+    logger.info(
+        "M3 stripe density: m3_stripe_density=%.2f (target_density=%.2f), affected bins=%d / %d (%.1f%%)" % (
+            m3_stripe_density, args.target_density, num_affected, total_bins,
+            100.0 * num_affected / total_bins
+        )
+    )
+
+
+
+def get_init_density_map(rawdb, gpdb, data: PlaceData, args, logger, ps=None):
+    # routing-layer index of M1 (--m1_rindex), for the M2/M3 snet masks here
+    # and in drv_feature_maps
+    data.m1_rindex = getattr(args, 'm1_rindex', 0)
+    lhs, rhs = data.fixed_index
+    device = data.node_size.get_device()
+    dtype = data.node_size.dtype
+    zeros_density_map = torch.zeros(
+        (data.num_bin_x, data.num_bin_y), device=device, dtype=dtype,
+    )
+    if lhs == rhs and (ps is None or not ps.zero_macro_grad):
+        data.init_density_map = zeros_density_map
+        return zeros_density_map
+    # get fix nodes which are located inside die
+    node_pos = data.node_pos[lhs:rhs]
+    node_size = data.node_size[lhs:rhs]
+    node_weight = node_size.new_ones(node_size.shape[0])
+    if ps is not None and ps.zero_macro_grad:
+        # compute the mov + fixed macro density map
+        node_pos = torch.cat([data.node_pos[data.is_mov_macro].contiguous(), node_pos])
+        node_size = torch.cat([data.node_size[data.is_mov_macro].contiguous(), node_size])
+        node_weight = node_size.new_ones(node_size.shape[0])
+    if args.timing_opt: # TODO: sideline
+        node_size = node_size.clone()
+        node_size[:, 0] *= 1.05
+    init_density_map = density_map_cuda.forward_naive(
+        node_pos, node_size, node_weight, data.unit_len, zeros_density_map,
+        data.num_bin_x, data.num_bin_y, node_pos.shape[0], -1.0, -1.0, 1e-4, False,
+        args.deterministic
+    )
+    init_density_map = init_density_map.contiguous()
+    if (init_density_map > 1).sum() > 0:
+        logger.warning("Some bins in init_density_map are overflow. Clamp them.")
+    if (init_density_map < 0).sum() > 0:
+        logger.error("init_density_map has negative value. Please check.")
+    if args.use_route_force or args.use_cell_inflate:
+        # consider snet as plaement blkg in density map to resolve M2 Vertical
+        # SNet pin access problem
+        if gpdb is not None and gpdb.m1direction() == 0:
+            # TODO: only include snet density when util is small
+            snet_lpos, snet_size, snet_layer = gpdb.snet_info_tensor()
+
+            snet_lpos = snet_lpos.to(device)
+            snet_size = snet_size.to(device)
+            snet_layer = snet_layer.to(device)
+            m2_mask = snet_layer == data.m1_rindex + 1  # M2
+            snet_lpos = snet_lpos[m2_mask, :]
+            snet_size = snet_size[m2_mask, :]
+            snet_lpos -= data.die_shift
+            snet_lpos /= data.die_scale
+            snet_size /= data.die_scale
+
+            snet_pos = snet_lpos + snet_size / 2
+            snet_weight = snet_size.new_ones(snet_size.shape[0])
+            snet_density_map = density_map_cuda.forward_naive(
+                snet_pos, snet_size, snet_weight, data.unit_len, zeros_density_map,
+                data.num_bin_x, data.num_bin_y, snet_pos.shape[0], -1.0, -1.0, 1e-4, False,
+                args.deterministic
+            )
+            init_density_map += snet_density_map.contiguous()
+
+            # compute utilization to determine whether there are sufficient space to enlarge snet density
+            mov_lhs, mov_rhs = data.movable_index
+            mov_node_size = data.node_size[mov_lhs:mov_rhs, ...]
+            total_mov_cell_area = torch.sum(torch.prod(mov_node_size, 1)).item()
+            die_area = torch.prod(data.die_ur - data.die_ll)
+            fixed_node_area = init_density_map.clamp_(min=0.0, max=1.0).sum() * data.bin_area
+            placeable_area = die_area - fixed_node_area
+            total_filler_area = max(args.target_density * placeable_area - total_mov_cell_area, 0.0)
+            if total_filler_area / total_mov_cell_area > 2:
+                # low utilization, can enlarge snet density to further enhance routability
+                tmp_map = init_density_map + (snet_density_map.contiguous() > 0.1).float()
+                diff_area = (tmp_map.clamp_(min=0.0, max=1.0).sum() * data.bin_area - fixed_node_area).item()
+                if diff_area < total_filler_area * 0.5:
+                    logger.info("Low utilization detect, enlarge snet density.")
+                    init_density_map += (snet_density_map.contiguous() > 0.1).float()
+                    init_density_map.clamp_(min=0.0, max=1.0)
+
+    init_density_map.clamp_(min=0.0, max=1.0).mul_(args.target_density)
+
+    if getattr(args, 'use_m3_snet_density', False) and gpdb is not None:
+        data.base_init_density_map = init_density_map.clone()
+        _apply_m3_snet_density_reduction(
+            gpdb, data, args, init_density_map, device, logger
+        )
+
+    if args.use_route_force or args.use_cell_inflate:
+        # inflate connected IOPins
+        _, fix_rhs, _ = data.node_type_indices[2]
+        _, iopin_rhs, _ = data.node_type_indices[3]
+        if fix_rhs != iopin_rhs:
+            zeros_density_map = torch.zeros(
+                (data.num_bin_x, data.num_bin_y), device=device, dtype=dtype,
+            )
+            iopin_pos = data.node_pos[fix_rhs:iopin_rhs]
+            iopin_size = data.node_size[fix_rhs:iopin_rhs]
+            iopin_weight = iopin_size.new_ones(iopin_size.shape[0])
+            iopin_density_map = density_map_cuda.forward_naive(
+                iopin_pos, iopin_size, iopin_weight, data.unit_len, zeros_density_map,
+                data.num_bin_x, data.num_bin_y, iopin_pos.shape[0], -1.0, -1.0, 1e-4, False,
+                args.deterministic
+            )
+            iopin_density_map = iopin_density_map.contiguous() * max(4 - 1, 0)
+            init_density_map += iopin_density_map
+    data.init_density_map = init_density_map
+    return data.init_density_map
+
+
+def _normalize_against(density_grad, other_grad, name):
+    # Ratio used to bring an auxiliary force onto the same scale as the density
+    # force. Returns 0 when the auxiliary gradient carries no signal, so the
+    # caller degrades to "force off" rather than inf/NaN.
+    ref = density_grad.abs().max()
+    if other_grad is None:
+        return torch.zeros_like(ref)
+    denom = other_grad.abs().max()
+    if not torch.isfinite(denom) or denom.item() <= 0:
+        print("[WARN] %s gradient is all-zero or non-finite, disabling %s force this round" % (name, name))
+        return torch.zeros_like(ref)
+    return (ref / denom).detach()
+
+
+def init_params(
+    mov_node_pos, trunc_node_pos_fn, mov_lhs, mov_rhs, conn_fix_node_pos,
+    density_map_layer, mov_node_size, expand_ratio, init_density_map, optimizer,
+    ps, data, args, route_fn=None
+):
+    mov_node_pos = trunc_node_pos_fn(mov_node_pos)
+    conn_node_pos = mov_node_pos[mov_lhs:mov_rhs, ...]
+    conn_node_pos = torch.cat(
+        [conn_node_pos, conn_fix_node_pos], dim=0
+    )
+    _, conn_node_grad = merged_wl_loss_grad(
+        conn_node_pos, data.pin_id2node_id, data.pin_rel_cpos,
+        data.node2pin_list, data.node2pin_list_end,
+        data.hyperedge_list, data.hyperedge_list_end, data.net_mask,
+        data.hpwl_scale, ps.wa_coeff, args.deterministic
+    )
+    wl_grad = torch.zeros_like(mov_node_pos).detach()
+    wl_grad[mov_lhs:mov_rhs] = conn_node_grad[mov_lhs:mov_rhs]
+    _, _, density_grad = density_map_layer.merged_density_loss_grad(
+        mov_node_pos, mov_node_size, init_density_map
+    )
+    if ps.zero_macro_grad:
+        wl_grad[mov_lhs:mov_rhs].masked_fill_(data.is_mov_macro[mov_lhs:mov_rhs].unsqueeze(1), 0)
+        density_grad[mov_lhs:mov_rhs].masked_fill_(data.is_mov_macro[mov_lhs:mov_rhs].unsqueeze(1), 0)
+    (mov_node_pos * 0.0).sum().backward()
+    optimizer.zero_grad(set_to_none=False)
+
+    if (not ps.rerun_route or route_fn is None) and not args.timing_opt:
+        init_density_weight = (wl_grad.norm(p=1) / density_grad.norm(p=1)).detach()
+        # init_density_weight = (wl_grad.norm(p=1) / grad_mat.norm(p=1)).detach()
+        ps.set_init_param(init_density_weight, data)
+    elif ps.rerun_route and route_fn is not None:
+        _, filler_lhs = data.movable_connected_index
+        filler_rhs = mov_node_pos.shape[0]
+
+        mov_route_grad, mov_congest_grad, mov_pseudo_grad = route_fn(
+            mov_node_pos, mov_node_size, expand_ratio, trunc_node_pos_fn
+        )
+        if mov_pseudo_grad is not None:
+            wl_grad.add_(mov_pseudo_grad * args.pseudo_weight)
+        init_density_weight = (wl_grad.norm(p=1) / density_grad.norm(p=1)).detach()
+        # The route/congestion forces are normalised against the density force.
+        # On an uncongested design the GR congestion map is all-zero, so the
+        # denominator is 0 and the ratio becomes inf -> the whole placement
+        # goes NaN a few iterations later. Fall back to a zero weight (force
+        # simply disabled for this round) instead of poisoning the gradients.
+        init_route_weight = _normalize_against(density_grad, mov_route_grad, "route")
+        # init_route_weight = (wl_grad[:filler_lhs].norm(p=1) / mov_route_grad[:filler_lhs].norm(p=1)).detach()
+        init_congest_weight = _normalize_against(density_grad, mov_congest_grad, "congest")
+        # print("Weight den: %.4f route: %.4f congest: %.4f" % (init_density_weight, init_route_weight, init_congest_weight))
+        ps.set_route_init_param(
+            init_density_weight, init_route_weight, init_congest_weight, data, args
+        )
+    elif args.timing_opt:
+        init_pin_weight = torch.ones(data.num_pins, dtype=torch.float32, device=data.device)
+        _, wl_grad_timing = merged_wl_loss_grad_timing(
+            conn_node_pos, init_pin_weight,
+            data.pin_id2node_id, data.pin_rel_cpos,
+            data.node2pin_list, data.node2pin_list_end, data.hyperedge_list, data.hyperedge_list_end,
+            data.net_mask, data.net_weight, data.hpwl_scale, ps.wa_coeff, args.deterministic
+        )
+        init_density_weight = ((wl_grad.norm(p=1) + wl_grad_timing.norm(p=1)) / density_grad.norm(p=1)).detach()
+        ps.set_init_param(init_density_weight, data)
+        ps.timing_wl_weight = args.timing_init_weight
+        data.gputimer.timing_pin_weight *= ps.timing_wl_weight
+        data.gputimer.beta = 5 * ps.timing_wl_weight
+        # timing mode fluctuation, larger divergence life
+        ps.max_life = 50
+        ps.life = ps.max_life
+
+# Nesterove learning rate initialization
+def estimate_initial_learning_rate(obj_and_grad_fn, constraint_fn, x_k, lr):
+    x_k = constraint_fn(x_k).clone().detach().requires_grad_(True)
+    obj_k, g_k = obj_and_grad_fn(x_k)
+    x_k_1 = (constraint_fn(x_k - lr * g_k)).clone().detach().requires_grad_(True)
+    obj_k_1, g_k_1 = obj_and_grad_fn(x_k_1)
+    return (x_k - x_k_1).norm(p=2) / (g_k - g_k_1).norm(p=2)

@@ -1,0 +1,225 @@
+========================================================================================
+  Pin Scarcity Gaussian Report (horizontal, M1 pins, flip-orientation robust)
+  S(x)      = sum_i (1/AP_i) * N(x; x_i, sigma)
+  S_flip(x) = sum_i (1/AP_i) * N(x; width - x_i, sigma)   (cell mirrored L/R)
+  M(x)      = max( S(x), S_flip(x) )   -- unknown row-flip orientation
+  score_flip_max = integral_0^width M(x) dx / num_sites   (ranking key)
+  score_as_placed = integral_0^width S(x) dx / num_sites  (single fixed orientation, for reference)
+========================================================================================
+
+  sigma (gaussian spread)   : 0.036
+  site width                : 0.054
+
+[Summary]  (score_flip_max)
+  Cells analysed            : 202
+  Min  score                : 0.001363
+  Max  score                : 0.032335
+  Mean score                : 0.014696
+  Median score              : 0.014821
+  Std dev                   : 0.007990
+  Mean score_as_placed      : 0.011367  (flip_max is always >= as_placed)
+
+[Ranking by score]  (rank : cell : score_flip_max : score_as_placed : num_pins : num_sites)
+  Highest scarcity density first (hardest pin access per site, worst-case orientation)
+     1  NAND3x1_ASAP7_75t_L                           flip_max=0.032335  as_placed=0.020711  pins=4   sites=11.00
+     2  OAI21xp5_ASAP7_75t_L                          flip_max=0.029694  as_placed=0.021314  pins=4   sites=5.00
+     3  A2O1A1Ixp33_ASAP7_75t_L                       flip_max=0.029495  as_placed=0.022279  pins=5   sites=6.00
+     4  AOI333xp33_ASAP7_75t_L                        flip_max=0.027806  as_placed=0.024825  pins=10  sites=11.00
+     5  OAI333xp33_ASAP7_75t_L                        flip_max=0.027806  as_placed=0.024825  pins=10  sites=11.00
+     6  AOI332xp33_ASAP7_75t_L                        flip_max=0.027579  as_placed=0.024300  pins=9   sites=10.00
+     7  OAI332xp33_ASAP7_75t_L                        flip_max=0.027579  as_placed=0.024300  pins=9   sites=10.00
+     8  OAI331xp33_ASAP7_75t_L                        flip_max=0.027299  as_placed=0.023657  pins=8   sites=9.00
+     9  AOI322xp5_ASAP7_75t_L                         flip_max=0.027177  as_placed=0.024493  pins=8   sites=9.00
+    10  OAI322xp33_ASAP7_75t_L                        flip_max=0.027177  as_placed=0.024493  pins=8   sites=9.00
+    11  AOI321xp33_ASAP7_75t_L                        flip_max=0.027059  as_placed=0.021839  pins=7   sites=8.00
+    12  OAI321xp33_ASAP7_75t_L                        flip_max=0.027059  as_placed=0.021839  pins=7   sites=8.00
+    13  OAI22xp5_ASAP7_75t_L                          flip_max=0.026998  as_placed=0.020903  pins=5   sites=6.00
+    14  AOI331xp33_ASAP7_75t_L                        flip_max=0.026521  as_placed=0.021491  pins=8   sites=9.00
+    15  AOI33xp33_ASAP7_75t_L                         flip_max=0.026490  as_placed=0.020793  pins=7   sites=8.00
+    16  OAI33xp33_ASAP7_75t_L                         flip_max=0.026490  as_placed=0.020793  pins=7   sites=8.00
+    17  AOI221xp5_ASAP7_75t_L                         flip_max=0.026349  as_placed=0.022896  pins=6   sites=7.00
+    18  OAI221xp5_ASAP7_75t_L                         flip_max=0.026349  as_placed=0.022896  pins=6   sites=7.00
+    19  FAx1_ASAP7_75t_L                              flip_max=0.026288  as_placed=0.022560  pins=5   sites=14.00
+    20  AOI222xp33_ASAP7_75t_L                        flip_max=0.026004  as_placed=0.017838  pins=7   sites=10.00
+    21  OA333x2_ASAP7_75t_L                           flip_max=0.025393  as_placed=0.021370  pins=10  sites=13.00
+    22  AO333x2_ASAP7_75t_L                           flip_max=0.025321  as_placed=0.020413  pins=10  sites=13.00
+    23  OA333x1_ASAP7_75t_L                           flip_max=0.025307  as_placed=0.023010  pins=10  sites=12.00
+    24  AO333x1_ASAP7_75t_L                           flip_max=0.025196  as_placed=0.022423  pins=10  sites=12.00
+    25  AOI22xp33_ASAP7_75t_L                         flip_max=0.025094  as_placed=0.019693  pins=5   sites=6.00
+    26  MAJIxp5_ASAP7_75t_L                           flip_max=0.025058  as_placed=0.016381  pins=4   sites=7.00
+    27  OAI22xp33_ASAP7_75t_L                         flip_max=0.025051  as_placed=0.019649  pins=5   sites=6.00
+    28  AO332x2_ASAP7_75t_L                           flip_max=0.024989  as_placed=0.020636  pins=9   sites=12.00
+    29  OA332x2_ASAP7_75t_L                           flip_max=0.024989  as_placed=0.020629  pins=9   sites=12.00
+    30  AOI22xp5_ASAP7_75t_L                          flip_max=0.024714  as_placed=0.019554  pins=5   sites=6.00
+    31  AOI32xp33_ASAP7_75t_L                         flip_max=0.024701  as_placed=0.019907  pins=6   sites=7.00
+    32  AO332x1_ASAP7_75t_L                           flip_max=0.024661  as_placed=0.022444  pins=9   sites=11.00
+    33  OA332x1_ASAP7_75t_L                           flip_max=0.024661  as_placed=0.022444  pins=9   sites=11.00
+    34  AOI211xp5_ASAP7_75t_L                         flip_max=0.024638  as_placed=0.021494  pins=5   sites=6.00
+    35  OAI211xp5_ASAP7_75t_L                         flip_max=0.024638  as_placed=0.021494  pins=5   sites=6.00
+    36  OAI21xp33_ASAP7_75t_L                         flip_max=0.024574  as_placed=0.018343  pins=4   sites=5.00
+    37  OA331x2_ASAP7_75t_L                           flip_max=0.024543  as_placed=0.020461  pins=8   sites=11.00
+    38  OAI222xp33_ASAP7_75t_L                        flip_max=0.024357  as_placed=0.018284  pins=7   sites=10.00
+    39  OA331x1_ASAP7_75t_L                           flip_max=0.024353  as_placed=0.022348  pins=8   sites=10.00
+    40  O2A1O1Ixp5_ASAP7_75t_L                        flip_max=0.024304  as_placed=0.017756  pins=5   sites=8.00
+    41  OAI32xp33_ASAP7_75t_L                         flip_max=0.024198  as_placed=0.020748  pins=6   sites=7.00
+    42  AO221x2_ASAP7_75t_L                           flip_max=0.024170  as_placed=0.014998  pins=6   sites=11.00
+    43  AO221x1_ASAP7_75t_L                           flip_max=0.024146  as_placed=0.016380  pins=6   sites=10.00
+    44  AO331x1_ASAP7_75t_L                           flip_max=0.023878  as_placed=0.020891  pins=8   sites=10.00
+    45  AO331x2_ASAP7_75t_L                           flip_max=0.023768  as_placed=0.019105  pins=8   sites=11.00
+    46  AOI31xp33_ASAP7_75t_L                         flip_max=0.022865  as_placed=0.017623  pins=5   sites=6.00
+    47  OAI31xp33_ASAP7_75t_L                         flip_max=0.022865  as_placed=0.017623  pins=5   sites=6.00
+    48  AO33x2_ASAP7_75t_L                            flip_max=0.022472  as_placed=0.017513  pins=7   sites=10.00
+    49  OA33x2_ASAP7_75t_L                            flip_max=0.022467  as_placed=0.017220  pins=7   sites=10.00
+    50  O2A1O1Ixp33_ASAP7_75t_L                       flip_max=0.022411  as_placed=0.021197  pins=5   sites=6.00
+    51  OAI31xp67_ASAP7_75t_L                         flip_max=0.022196  as_placed=0.015120  pins=5   sites=13.00
+    52  MAJx3_ASAP7_75t_L                             flip_max=0.021210  as_placed=0.013478  pins=4   sites=10.00
+    53  OA211x2_ASAP7_75t_L                           flip_max=0.021170  as_placed=0.017650  pins=5   sites=8.00
+    54  AO32x2_ASAP7_75t_L                            flip_max=0.021055  as_placed=0.016116  pins=6   sites=9.00
+    55  AO32x1_ASAP7_75t_L                            flip_max=0.021011  as_placed=0.017595  pins=6   sites=8.00
+    56  AOI311xp33_ASAP7_75t_L                        flip_max=0.020409  as_placed=0.016372  pins=6   sites=7.00
+    57  OAI311xp33_ASAP7_75t_L                        flip_max=0.020409  as_placed=0.016372  pins=6   sites=7.00
+    58  AO222x2_ASAP7_75t_L                           flip_max=0.019976  as_placed=0.014976  pins=7   sites=12.00
+    59  OA222x2_ASAP7_75t_L                           flip_max=0.019976  as_placed=0.014976  pins=7   sites=12.00
+    60  SDFLx1_ASAP7_75t_L                            flip_max=0.019764  as_placed=0.010560  pins=5   sites=25.00
+    61  AO322x2_ASAP7_75t_L                           flip_max=0.019682  as_placed=0.013662  pins=8   sites=15.00
+    62  SDFHx1_ASAP7_75t_L                            flip_max=0.019480  as_placed=0.010381  pins=5   sites=25.00
+    63  MAJx2_ASAP7_75t_L                             flip_max=0.019407  as_placed=0.014935  pins=4   sites=9.00
+    64  NOR5xp2_ASAP7_75t_L                           flip_max=0.018906  as_placed=0.016674  pins=6   sites=7.00
+    65  OA22x2_ASAP7_75t_L                            flip_max=0.018670  as_placed=0.011553  pins=5   sites=10.00
+    66  AOI21xp5_ASAP7_75t_L                          flip_max=0.018669  as_placed=0.015311  pins=4   sites=5.00
+    67  SDFHx2_ASAP7_75t_L                            flip_max=0.018580  as_placed=0.010217  pins=5   sites=26.00
+    68  SDFLx2_ASAP7_75t_L                            flip_max=0.018580  as_placed=0.010217  pins=5   sites=26.00
+    69  AOI21xp33_ASAP7_75t_L                         flip_max=0.017806  as_placed=0.015357  pins=4   sites=5.00
+    70  DFFASRHQNx1_ASAP7_75t_L                       flip_max=0.017806  as_placed=0.009287  pins=5   sites=26.00
+    71  NAND3xp33_ASAP7_75t_L                         flip_max=0.017521  as_placed=0.014628  pins=4   sites=5.00
+    72  NOR3xp33_ASAP7_75t_L                          flip_max=0.017521  as_placed=0.014628  pins=4   sites=5.00
+    73  AO22x2_ASAP7_75t_L                            flip_max=0.017486  as_placed=0.011436  pins=5   sites=10.00
+    74  NAND5xp2_ASAP7_75t_L                          flip_max=0.017386  as_placed=0.015613  pins=6   sites=7.00
+    75  AO22x1_ASAP7_75t_L                            flip_max=0.017221  as_placed=0.012556  pins=5   sites=9.00
+    76  AOI22x1_ASAP7_75t_L                           flip_max=0.017219  as_placed=0.014589  pins=5   sites=10.00
+    77  OAI22x1_ASAP7_75t_L                           flip_max=0.017219  as_placed=0.014589  pins=5   sites=10.00
+    78  AO21x2_ASAP7_75t_L                            flip_max=0.017198  as_placed=0.013591  pins=4   sites=7.00
+    79  A2O1A1O1Ixp25_ASAP7_75t_L                     flip_max=0.017165  as_placed=0.014169  pins=6   sites=9.00
+    80  SDFHx3_ASAP7_75t_L                            flip_max=0.016847  as_placed=0.009853  pins=5   sites=27.00
+    81  SDFLx3_ASAP7_75t_L                            flip_max=0.016847  as_placed=0.009853  pins=5   sites=27.00
+    82  NAND4xp25_ASAP7_75t_L                         flip_max=0.016533  as_placed=0.015207  pins=5   sites=6.00
+    83  NOR4xp25_ASAP7_75t_L                          flip_max=0.016533  as_placed=0.015207  pins=5   sites=6.00
+    84  AND3x1_ASAP7_75t_L                            flip_max=0.016349  as_placed=0.013849  pins=4   sites=6.00
+    85  OR3x1_ASAP7_75t_L                             flip_max=0.016349  as_placed=0.013849  pins=4   sites=6.00
+    86  OA21x2_ASAP7_75t_L                            flip_max=0.016310  as_placed=0.014829  pins=4   sites=7.00
+    87  NAND2xp67_ASAP7_75t_L                         flip_max=0.016052  as_placed=0.010813  pins=3   sites=6.00
+    88  AO21x1_ASAP7_75t_L                            flip_max=0.016018  as_placed=0.015735  pins=4   sites=6.00
+    89  AOI221x1_ASAP7_75t_L                          flip_max=0.015876  as_placed=0.013424  pins=6   sites=14.00
+    90  AND3x2_ASAP7_75t_L                            flip_max=0.015669  as_placed=0.011712  pins=4   sites=7.00
+    91  OR3x2_ASAP7_75t_L                             flip_max=0.015669  as_placed=0.011712  pins=4   sites=7.00
+    92  NAND2x1_ASAP7_75t_L                           flip_max=0.015529  as_placed=0.010732  pins=3   sites=6.00
+    93  AND5x1_ASAP7_75t_L                            flip_max=0.015365  as_placed=0.014102  pins=6   sites=8.00
+    94  OR5x1_ASAP7_75t_L                             flip_max=0.015365  as_placed=0.014102  pins=6   sites=8.00
+    95  OA31x2_ASAP7_75t_L                            flip_max=0.015242  as_placed=0.009949  pins=5   sites=15.00
+    96  OR5x2_ASAP7_75t_L                             flip_max=0.015161  as_placed=0.012648  pins=6   sites=9.00
+    97  OR4x1_ASAP7_75t_L                             flip_max=0.015116  as_placed=0.013461  pins=5   sites=7.00
+    98  AND4x1_ASAP7_75t_L                            flip_max=0.014978  as_placed=0.013520  pins=5   sites=7.00
+    99  AOI21x1_ASAP7_75t_L                           flip_max=0.014969  as_placed=0.014100  pins=4   sites=8.00
+   100  OAI21x1_ASAP7_75t_L                           flip_max=0.014969  as_placed=0.014100  pins=4   sites=8.00
+   101  AND4x2_ASAP7_75t_L                            flip_max=0.014821  as_placed=0.011948  pins=5   sites=8.00
+   102  OR4x2_ASAP7_75t_L                             flip_max=0.014821  as_placed=0.011948  pins=5   sites=8.00
+   103  NAND2xp33_ASAP7_75t_L                         flip_max=0.014685  as_placed=0.012684  pins=3   sites=4.00
+   104  NOR2xp33_ASAP7_75t_L                          flip_max=0.014685  as_placed=0.012684  pins=3   sites=4.00
+   105  NAND2xp5_ASAP7_75t_L                          flip_max=0.014648  as_placed=0.012685  pins=3   sites=4.00
+   106  OR3x4_ASAP7_75t_L                             flip_max=0.014638  as_placed=0.009159  pins=4   sites=9.00
+   107  ICGx4_ASAP7_75t_L                             flip_max=0.014117  as_placed=0.007860  pins=4   sites=21.00
+   108  NOR3x1_ASAP7_75t_L                            flip_max=0.013845  as_placed=0.008641  pins=4   sites=11.00
+   109  ICGx3_ASAP7_75t_L                             flip_max=0.013827  as_placed=0.008252  pins=4   sites=20.00
+   110  ICGx5_ASAP7_75t_L                             flip_max=0.013689  as_placed=0.007503  pins=4   sites=22.00
+   111  AOI211x1_ASAP7_75t_L                          flip_max=0.013309  as_placed=0.009618  pins=5   sites=12.00
+   112  ICGx1_ASAP7_75t_L                             flip_max=0.013193  as_placed=0.009119  pins=4   sites=18.00
+   113  NOR2xp67_ASAP7_75t_L                          flip_max=0.013167  as_placed=0.009590  pins=3   sites=6.00
+   114  NOR2x1_ASAP7_75t_L                            flip_max=0.013006  as_placed=0.009539  pins=3   sites=6.00
+   115  AND2x4_ASAP7_75t_L                            flip_max=0.012628  as_placed=0.007820  pins=3   sites=10.00
+   116  XNOR2x2_ASAP7_75t_L                           flip_max=0.012465  as_placed=0.008168  pins=3   sites=11.00
+   117  XOR2x2_ASAP7_75t_L                            flip_max=0.012465  as_placed=0.008168  pins=3   sites=11.00
+   118  ICGx2_ASAP7_75t_L                             flip_max=0.012431  as_placed=0.008679  pins=4   sites=19.00
+   119  OA221x2_ASAP7_75t_L                           flip_max=0.012371  as_placed=0.010315  pins=6   sites=16.00
+   120  OR2x2_ASAP7_75t_L                             flip_max=0.011821  as_placed=0.008916  pins=3   sites=6.00
+   121  AND2x6_ASAP7_75t_L                            flip_max=0.011536  as_placed=0.006517  pins=3   sites=12.00
+   122  AOI31xp67_ASAP7_75t_L                         flip_max=0.011262  as_placed=0.008463  pins=5   sites=13.00
+   123  NAND4xp75_ASAP7_75t_L                         flip_max=0.011260  as_placed=0.007672  pins=5   sites=14.00
+   124  NOR4xp75_ASAP7_75t_L                          flip_max=0.011260  as_placed=0.007672  pins=5   sites=14.00
+   125  AO211x2_ASAP7_75t_L                           flip_max=0.010760  as_placed=0.006678  pins=5   sites=16.00
+   126  AO31x2_ASAP7_75t_L                            flip_max=0.010757  as_placed=0.008089  pins=5   sites=16.00
+   127  AND3x4_ASAP7_75t_L                            flip_max=0.010708  as_placed=0.006982  pins=4   sites=14.00
+   128  AND2x2_ASAP7_75t_L                            flip_max=0.010452  as_placed=0.008500  pins=3   sites=6.00
+   129  HAxp5_ASAP7_75t_L                             flip_max=0.010035  as_placed=0.008354  pins=4   sites=9.00
+   130  HB1xp67_ASAP7_75t_L                           flip_max=0.009979  as_placed=0.008449  pins=2   sites=4.00
+   131  OR2x4_ASAP7_75t_L                             flip_max=0.009711  as_placed=0.006744  pins=3   sites=8.00
+   132  SDFHx4_ASAP7_75t_L                            flip_max=0.009365  as_placed=0.005088  pins=5   sites=31.00
+   133  SDFLx4_ASAP7_75t_L                            flip_max=0.009365  as_placed=0.005088  pins=5   sites=31.00
+   134  INVx2_ASAP7_75t_L                             flip_max=0.009328  as_placed=0.007162  pins=2   sites=4.00
+   135  AND5x2_ASAP7_75t_L                            flip_max=0.009296  as_placed=0.007457  pins=6   sites=20.00
+   136  INVx1_ASAP7_75t_L                             flip_max=0.009196  as_placed=0.008981  pins=2   sites=3.00
+   137  INVxp33_ASAP7_75t_L                           flip_max=0.009196  as_placed=0.008981  pins=2   sites=3.00
+   138  INVxp67_ASAP7_75t_L                           flip_max=0.009196  as_placed=0.008981  pins=2   sites=3.00
+   139  XNOR2x1_ASAP7_75t_L                           flip_max=0.009086  as_placed=0.006893  pins=3   sites=12.00
+   140  XOR2x1_ASAP7_75t_L                            flip_max=0.009086  as_placed=0.006893  pins=3   sites=12.00
+   141  BUFx2_ASAP7_75t_L                             flip_max=0.008843  as_placed=0.006984  pins=2   sites=5.00
+   142  BUFx3_ASAP7_75t_L                             flip_max=0.008778  as_placed=0.005871  pins=2   sites=6.00
+   143  NOR2x1p5_ASAP7_75t_L                          flip_max=0.008680  as_placed=0.006433  pins=3   sites=8.00
+   144  BUFx4_ASAP7_75t_L                             flip_max=0.008552  as_placed=0.005039  pins=2   sites=7.00
+   145  HB2xp67_ASAP7_75t_L                           flip_max=0.008420  as_placed=0.006908  pins=2   sites=5.00
+   146  TIEHIx1_ASAP7_75t_L                           flip_max=0.008346  as_placed=0.005655  pins=1   sites=3.00
+   147  TIELOx1_ASAP7_75t_L                           flip_max=0.008346  as_placed=0.005655  pins=1   sites=3.00
+   148  NAND2x1p5_ASAP7_75t_L                         flip_max=0.008258  as_placed=0.006433  pins=3   sites=8.00
+   149  XNOR2xp5_ASAP7_75t_L                          flip_max=0.008162  as_placed=0.006182  pins=3   sites=9.00
+   150  XOR2xp5_ASAP7_75t_L                           flip_max=0.008130  as_placed=0.005848  pins=3   sites=9.00
+   151  HB4xp67_ASAP7_75t_L                           flip_max=0.008092  as_placed=0.005946  pins=2   sites=7.00
+   152  BUFx5_ASAP7_75t_L                             flip_max=0.008044  as_placed=0.004409  pins=2   sites=8.00
+   153  NAND2x2_ASAP7_75t_L                           flip_max=0.007695  as_placed=0.007069  pins=3   sites=10.00
+   154  NOR2x2_ASAP7_75t_L                            flip_max=0.007695  as_placed=0.007069  pins=3   sites=10.00
+   155  INVx3_ASAP7_75t_L                             flip_max=0.007686  as_placed=0.005731  pins=2   sites=5.00
+   156  INVx4_ASAP7_75t_L                             flip_max=0.007387  as_placed=0.004784  pins=2   sites=6.00
+   157  OR2x6_ASAP7_75t_L                             flip_max=0.007141  as_placed=0.004619  pins=3   sites=12.00
+   158  HB3xp67_ASAP7_75t_L                           flip_max=0.007089  as_placed=0.005756  pins=2   sites=6.00
+   159  INVx5_ASAP7_75t_L                             flip_max=0.006922  as_placed=0.004101  pins=2   sites=7.00
+   160  NAND3x2_ASAP7_75t_L                           flip_max=0.006907  as_placed=0.006166  pins=4   sites=20.00
+   161  NOR3x2_ASAP7_75t_L                            flip_max=0.006907  as_placed=0.006166  pins=4   sites=20.00
+   162  DHLx2_ASAP7_75t_L                             flip_max=0.006758  as_placed=0.004359  pins=3   sites=16.00
+   163  DHLx1_ASAP7_75t_L                             flip_max=0.006390  as_placed=0.003765  pins=3   sites=15.00
+   164  INVx6_ASAP7_75t_L                             flip_max=0.006363  as_placed=0.003588  pins=2   sites=8.00
+   165  DLLx1_ASAP7_75t_L                             flip_max=0.006360  as_placed=0.003787  pins=3   sites=15.00
+   166  DLLx3_ASAP7_75t_L                             flip_max=0.006172  as_placed=0.004147  pins=3   sites=17.00
+   167  BUFx4f_ASAP7_75t_L                            flip_max=0.005986  as_placed=0.003659  pins=2   sites=8.00
+   168  BUFx6f_ASAP7_75t_L                            flip_max=0.005531  as_placed=0.002890  pins=2   sites=10.00
+   169  ICGx2p67DC_ASAP7_75t_L                        flip_max=0.005511  as_placed=0.003917  pins=4   sites=48.00
+   170  ICGx4DC_ASAP7_75t_L                           flip_max=0.005511  as_placed=0.003917  pins=4   sites=48.00
+   171  ICGx5p33DC_ASAP7_75t_L                        flip_max=0.005511  as_placed=0.003917  pins=4   sites=48.00
+   172  ICGx6p67DC_ASAP7_75t_L                        flip_max=0.005511  as_placed=0.003917  pins=4   sites=48.00
+   173  ICGx8DC_ASAP7_75t_L                           flip_max=0.005511  as_placed=0.003917  pins=4   sites=48.00
+   174  DHLx3_ASAP7_75t_L                             flip_max=0.005418  as_placed=0.003445  pins=3   sites=17.00
+   175  INVx8_ASAP7_75t_L                             flip_max=0.005272  as_placed=0.002871  pins=2   sites=10.00
+   176  DFFHQNx2_ASAP7_75t_L                          flip_max=0.005137  as_placed=0.003324  pins=3   sites=21.00
+   177  DLLx2_ASAP7_75t_L                             flip_max=0.005112  as_placed=0.003657  pins=3   sites=16.00
+   178  BUFx8_ASAP7_75t_L                             flip_max=0.004826  as_placed=0.002439  pins=2   sites=12.00
+   179  DFFHQNx1_ASAP7_75t_L                          flip_max=0.004800  as_placed=0.002824  pins=3   sites=20.00
+   180  DFFLQNx1_ASAP7_75t_L                          flip_max=0.004800  as_placed=0.002824  pins=3   sites=20.00
+   181  DFFLQNx2_ASAP7_75t_L                          flip_max=0.004273  as_placed=0.002768  pins=3   sites=21.00
+   182  BUFx10_ASAP7_75t_L                            flip_max=0.004156  as_placed=0.002086  pins=2   sites=14.00
+   183  INVx11_ASAP7_75t_L                            flip_max=0.004079  as_placed=0.002208  pins=2   sites=13.00
+   184  DFFLQNx3_ASAP7_75t_L                          flip_max=0.003727  as_placed=0.002660  pins=3   sites=22.00
+   185  DFFHQNx3_ASAP7_75t_L                          flip_max=0.003709  as_placed=0.002660  pins=3   sites=22.00
+   186  BUFx12_ASAP7_75t_L                            flip_max=0.003577  as_placed=0.001794  pins=2   sites=16.00
+   187  INVx13_ASAP7_75t_L                            flip_max=0.003536  as_placed=0.001914  pins=2   sites=15.00
+   188  DFFLQx4_ASAP7_75t_L                           flip_max=0.003499  as_placed=0.002223  pins=3   sites=25.00
+   189  DFFHQx4_ASAP7_75t_L                           flip_max=0.003447  as_placed=0.002223  pins=3   sites=25.00
+   190  BUFx12f_ASAP7_75t_L                           flip_max=0.003174  as_placed=0.001587  pins=2   sites=18.00
+   191  CKINVDCx10_ASAP7_75t_L                        flip_max=0.002713  as_placed=0.002005  pins=2   sites=24.00
+   192  CKINVDCx6p67_ASAP7_75t_L                      flip_max=0.002713  as_placed=0.002005  pins=2   sites=24.00
+   193  BUFx16f_ASAP7_75t_L                           flip_max=0.002544  as_placed=0.001272  pins=2   sites=22.00
+   194  CKINVDCx14_ASAP7_75t_L                        flip_max=0.002244  as_placed=0.001719  pins=2   sites=28.00
+   195  CKINVDCx9p33_ASAP7_75t_L                      flip_max=0.002244  as_placed=0.001719  pins=2   sites=28.00
+   196  CKINVDCx5p33_ASAP7_75t_L                      flip_max=0.002188  as_placed=0.002188  pins=2   sites=22.00
+   197  CKINVDCx8_ASAP7_75t_L                         flip_max=0.002188  as_placed=0.002188  pins=2   sites=22.00
+   198  BUFx24_ASAP7_75t_L                            flip_max=0.001914  as_placed=0.000957  pins=2   sites=30.00
+   199  CKINVDCx11_ASAP7_75t_L                        flip_max=0.001851  as_placed=0.001851  pins=2   sites=26.00
+   200  CKINVDCx12_ASAP7_75t_L                        flip_max=0.001851  as_placed=0.001851  pins=2   sites=26.00
+   201  CKINVDCx16_ASAP7_75t_L                        flip_max=0.001726  as_placed=0.001604  pins=2   sites=30.00
+   202  CKINVDCx20_ASAP7_75t_L                        flip_max=0.001363  as_placed=0.001267  pins=2   sites=38.00
